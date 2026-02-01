@@ -5,49 +5,61 @@ import os
 from pynput import keyboard
 
 # CONFIGURATION
-TIMEOUT_SECONDS = 1800  # 30 minutes
+TIMEOUT_SECONDS = 600   # 10 minutes
+COOLDOWN_SECONDS = 5    # 5-second cooldown
 last_activity = time.time()
+last_trigger_time = 0
 
-def reset_timer():
+def reset_activity_timer():
     global last_activity
     last_activity = time.time()
 
 def monitor_timeout():
-    """Background thread that closes the listener after inactivity."""
+    """Shuts down after 10 minutes of silence."""
     while True:
-        time.sleep(10) # Check every 10 seconds
-        elapsed = time.time() - last_activity
-        if elapsed > TIMEOUT_SECONDS:
-            print("\n[!] Otto Listener shutting down due to 30 minutes of inactivity.")
-            # Hard exit to ensure all threads stop
+        time.sleep(10)
+        if time.time() - last_activity > TIMEOUT_SECONDS:
+            print("\n[!] AI-Study-Tool shutting down due to inactivity.")
             os._exit(0)
 
-def on_capture():
-    reset_timer()
-    print("\n[!] Triggering Capture...")
-    subprocess.run(["python", "otto.py", "capture"])
+def run_command(command_type):
+    global last_trigger_time
+    
+    # Cooldown logic
+    elapsed = time.time() - last_trigger_time
+    if elapsed < COOLDOWN_SECONDS:
+        print(f"⏳ Cooldown active... wait {int(COOLDOWN_SECONDS - elapsed)}s.")
+        return 
 
-def on_answer():
-    reset_timer()
-    print("\n[!] Revealing Latest Answer...")
-    subprocess.run(["python", "otto.py", "answer"])
+    last_trigger_time = time.time()
+    reset_activity_timer()
 
-# Define the hotkeys using the <ctrl>+<alt>+char syntax
-# This is much more stable on Windows
+    if command_type == "capture":
+        print("\n[!] Capturing...")
+        threading.Thread(target=subprocess.run, args=(["python", "otto.py", "capture"],)).start()
+        
+    elif command_type == "answer":
+        print("\n[!] Revealing...")
+        threading.Thread(target=subprocess.run, args=(["python", "otto.py", "answer"],)).start()
+
+def on_exit():
+    print("\n[!] Exiting AI-Study-Tool.")
+    os._exit(0)
+
+# Hotkey Map (Alt + Shift + Letter)
 hotkeys_map = {
-    '<ctrl>+<alt>+q': on_capture,
-    '<ctrl>+<alt>+a': on_answer
+    '<alt>+<shift>+q': lambda: run_command("capture"),
+    '<alt>+<shift>+a': lambda: run_command("answer"),
+    '<alt>+<shift>+e': on_exit
 }
 
-print("Otto is listening...")
-print("Press Ctrl+Alt+Q to Capture.")
-print("Press Ctrl+Alt+A to See Latest Answer.")
-print(f"Auto-shutdown active: Script will close after 30 mins of inactivity.")
+print("👂 AI-Study-Tool is listening...")
+print("  Alt + Shift + Q : Capture")
+print("  Alt + Shift + A : Answer")
+print("  Alt + Shift + E : Exit")
+print(f"  (Cooldown: {COOLDOWN_SECONDS}s | Auto-exit: 10m)")
 
-# Start the timeout monitor in a separate thread
-timer_thread = threading.Thread(target=monitor_timeout, daemon=True)
-timer_thread.start()
+threading.Thread(target=monitor_timeout, daemon=True).start()
 
-# Start the GlobalHotKeys listener
 with keyboard.GlobalHotKeys(hotkeys_map) as h:
     h.join()
