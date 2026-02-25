@@ -33,28 +33,40 @@ def capture_and_interpret():
         image = Image.open(img_path)
 
         prompt = """
-        Analyze this educational image.
-        
-        INSTRUCTIONS:
-        1. Identify the main content on the screen. Read content carefully.
-        2. Extract fields into JSON:
-           - question_text: string
-           - classification: as a string, (Multiple Choice, Fill In The Blank, Categorization, True/False, Short Answer, if the type is something else infer to the best of your abilites what it is)
-           - options: as a valid list of strings, write the provided posible answers for the question. For multiple choice this is the differenc choices. For T/F its T or F. For Fill In The Blank its all the words in the word bank. For Categorization is all the different prompts that need to be clasified as correct or incorrect. For short answers its NA. For a type not specified you can imply what the choices are)
-           - context: as a string, A neutral, factual paragraph, explaining the concept in enough detail to clearly understand everything that is being talked about.
-           - answer: Type myst be a string. Not a list, not a dict, a string. The correct answer. Just give enough information to answer the question, nothing more.
-				For Multiple Choice: as a string, Restate the correct choice as is, do not change anything.
-                For Fill In The Blank: as a string, Provide the order that the correct answers would fill in all of the blanks. Its of if not all the words in the word bank are used.
-           - suggested_mapping: (For Categorization items) Dictionary.
-           - confidence: float (0.0 to 1.0)
-        
-        IMPORTANT ON CONFIDENCE:
-        - Be highly conservative. 
-        - 1.0 is reserved for perfectly clear text and obvious answers.
-        - If the text is slightly blurry, or the question is ambiguous, drop confidence to 0.7 or lower.
-        - It is better to show low confidence than to be confidently wrong.
-        
-        Very Important that responce is in proper JSON format.
+                Analyze this educational screenshot and return ONLY valid JSON.
+
+                REQUIRED OUTPUT SCHEMA (all keys required):
+                {
+                    "question_text": "string",
+                    "question_type": "MULTIPLE_CHOICE|TRUE_FALSE|FILL_IN_THE_BLANK|CATEGORIZATION|SHORT_ANSWER|OTHER",
+                    "classification": "human readable label",
+                    "options": ["string"],
+                    "context": "string",
+                    "answer": "string",
+                    "suggested_mapping": {"category": ["item"]},
+                    "answer_payload": {},
+                    "confidence": 0.0
+                }
+
+                answer_payload MUST match question_type:
+                - MULTIPLE_CHOICE -> {"selected_option": "exact option text"}
+                - TRUE_FALSE -> {"is_true": true|false}
+                - FILL_IN_THE_BLANK -> {"blanks": ["answer1", "answer2"]}
+                - CATEGORIZATION -> {"categories": {"category": ["item"]}}
+                - SHORT_ANSWER -> {"short_answer": "string"}
+                - OTHER -> {"other_answer": "string"}
+
+                Rules:
+                - Return strict JSON only. No markdown, no code fences, no commentary.
+                - options must always be a JSON array of strings (empty array is allowed).
+                - answer must always be a string summary of the final answer.
+                - For CATEGORIZATION, suggested_mapping must mirror answer_payload.categories.
+                - If uncertain, still return schema-compliant JSON and lower confidence.
+
+                Confidence policy:
+                - Be conservative and calibrated to readability and ambiguity.
+                - Use 1.0 only for perfectly clear text and unambiguous answer.
+                - Slight blur/partial occlusion/ambiguity should reduce confidence significantly.
         """
 
         # 2. Iterative Model Fallback

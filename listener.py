@@ -2,13 +2,14 @@ import subprocess
 import threading
 import time
 import os
+import sys
 from pynput import keyboard
 
 # CONFIGURATION
 TIMEOUT_SECONDS = 600   # 10 minutes
-COOLDOWN_SECONDS = 5    # 5-second cooldown
 last_activity = time.time()
-last_trigger_time = 0
+command_in_progress = False
+command_lock = threading.Lock()
 
 def reset_activity_timer():
     global last_activity
@@ -23,24 +24,42 @@ def monitor_timeout():
             os._exit(0)
 
 def run_command(command_type):
-    global last_trigger_time
-    
-    # Cooldown logic
-    elapsed = time.time() - last_trigger_time
-    if elapsed < COOLDOWN_SECONDS:
-        print(f"⏳ Cooldown active... wait {int(COOLDOWN_SECONDS - elapsed)}s.")
-        return 
+    global command_in_progress
 
-    last_trigger_time = time.time()
+    with command_lock:
+        if command_in_progress:
+            print("⏳ A command is already running... please wait for output.")
+            return
+        command_in_progress = True
+
     reset_activity_timer()
 
+    def worker(args, label):
+        global command_in_progress
+        try:
+            print(f"\n[!] {label}...")
+            subprocess.run(args)
+        finally:
+            with command_lock:
+                command_in_progress = False
+
     if command_type == "capture":
-        print("\n[!] Capturing...")
-        threading.Thread(target=subprocess.run, args=(["python", "otto.py", "capture"],)).start()
-        
+        threading.Thread(
+            target=worker,
+            args=([sys.executable, "otto.py", "capture"], "Capturing"),
+            daemon=True
+        ).start()
+
     elif command_type == "answer":
-        print("\n[!] Revealing...")
-        threading.Thread(target=subprocess.run, args=(["python", "otto.py", "answer"],)).start()
+        threading.Thread(
+            target=worker,
+            args=([sys.executable, "otto.py", "answer"], "Revealing"),
+            daemon=True
+        ).start()
+
+    else:
+        with command_lock:
+            command_in_progress = False
 
 def on_exit():
     print("\n[!] Exiting AI-Study-Tool.")
@@ -57,7 +76,7 @@ print("👂 AI-Study-Tool is listening...")
 print("  Alt + Shift + Q : Capture")
 print("  Alt + Shift + A : Answer")
 print("  Alt + Shift + E : Exit")
-print(f"  (Cooldown: {COOLDOWN_SECONDS}s | Auto-exit: 10m)")
+print("  (Single command at a time | Auto-exit: 10m)")
 
 threading.Thread(target=monitor_timeout, daemon=True).start()
 
