@@ -12,12 +12,49 @@ load_dotenv()
 # Client setup
 client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
 
-# HIERARCHY: Verified from your Google Cloud Dashboard
-MODEL_FALLBACKS = [
-    "gemini-2.5-flash",       # Primary
-    "gemini-3-flash",         # Secondary (Backup 1)
-    "gemini-2.5-flash-lite"   # Tertiary (Backup 2)
+# Default fallback order for question extraction (text/vision-capable models only).
+# Excludes TTS, embedding, image generation, video generation, robotics, and tooling models.
+DEFAULT_MODEL_FALLBACKS = [
+    "gemini-2.5-flash",       # Primary fast default
+    "gemini-2.5-pro",         # Higher quality fallback
+    "gemini-3-flash",         # Fast backup
+    "gemini-3-pro",           # Higher quality backup
+    "gemini-3.1-pro",         # High reasoning fallback
+    "gemini-2-flash",         # Legacy fast fallback
+    "gemini-2-flash-exp",     # Experimental fallback
+    "gemini-2-pro-exp",       # Experimental pro fallback
+    "gemini-2.5-flash-lite",  # Low-cost final fallback
 ]
+
+
+def get_model_fallbacks():
+    override = os.getenv("OTTO_MODEL_FALLBACKS", "").strip()
+    if not override:
+        return DEFAULT_MODEL_FALLBACKS
+
+    models = [item.strip() for item in override.split(",") if item.strip()]
+    return models or DEFAULT_MODEL_FALLBACKS
+
+
+def _inject_model_used(raw_text, model_name):
+    content = (raw_text or "").strip()
+    if content.startswith("```"):
+        lines = content.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        content = "\n".join(lines).strip()
+
+    try:
+        payload = json.loads(content)
+    except Exception:
+        return raw_text
+
+    if isinstance(payload, dict):
+        payload["model_used"] = model_name
+        return json.dumps(payload)
+    return raw_text
 
 def capture_and_interpret():
     try:
@@ -38,7 +75,7 @@ def capture_and_interpret():
                 REQUIRED OUTPUT SCHEMA (all keys required):
                 {
                     "question_text": "string",
-                    "question_type": "MULTIPLE_CHOICE|TRUE_FALSE|FILL_IN_THE_BLANK|CATEGORIZATION|SHORT_ANSWER|OTHER",
+                    "question_type": "MULTIPLE_CHOICE|TRUE_FALSE|FILL_IN_THE_BLANK|CATEGORIZATION|ORDERING|SHORT_ANSWER|OTHER",
                     "classification": "human readable label",
                     "options": ["string"],
                     "context": "string",
@@ -53,6 +90,7 @@ def capture_and_interpret():
                 - TRUE_FALSE -> {"is_true": true|false}
                 - FILL_IN_THE_BLANK -> {"blanks": ["answer1", "answer2"]}
                 - CATEGORIZATION -> {"categories": {"category": ["item"]}}
+                - ORDERING -> {"ordered_items": ["first", "second", "third"]}
                 - SHORT_ANSWER -> {"short_answer": "string"}
                 - OTHER -> {"other_answer": "string"}
 
@@ -60,6 +98,8 @@ def capture_and_interpret():
                 - Return strict JSON only. No markdown, no code fences, no commentary.
                 - options must always be a JSON array of strings (empty array is allowed).
                 - answer must always be a string summary of the final answer.
+                - context must be one study-friendly paragraph that naturally includes key facts needed to derive the answer.
+                - do not write "the answer is ..." inside context; weave supporting facts into the explanation.
                 - For CATEGORIZATION, suggested_mapping must mirror answer_payload.categories.
                 - If uncertain, still return schema-compliant JSON and lower confidence.
 
@@ -70,7 +110,8 @@ def capture_and_interpret():
         """
 
         # 2. Iterative Model Fallback
-        for model_name in MODEL_FALLBACKS:
+        model_fallbacks = get_model_fallbacks()
+        for model_name in model_fallbacks:
             try:
                 # Attempt generation
                 response = client.models.generate_content(
@@ -82,7 +123,7 @@ def capture_and_interpret():
                 )
                 
                 if response.text:
-                    return response.text
+                    return _inject_model_used(response.text, model_name)
                 
             except Exception as e:
                 # If a model fails, we log it in the terminal and try the next one
@@ -91,7 +132,7 @@ def capture_and_interpret():
         
         return json.dumps({
             "error": "All models exhausted", 
-            "details": "Check Dashboard limits for 2.5-flash, 3-flash, and 2.5-flash-lite."
+            "details": f"All fallbacks failed. Tried: {', '.join(model_fallbacks)}"
         })
 
     except Exception as e:

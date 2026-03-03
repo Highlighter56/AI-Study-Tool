@@ -12,5 +12,6 @@ class OttoQuestion(BaseModel):
     answer: Optional[str] = None
     suggested_mapping: Optional[Dict[str, Any]] = None
     answer_payload: Dict[str, Any] = Field(default_factory=dict)
+    model_used: Optional[str] = None
     confidence: float
     confidence_reasons: List[str] = Field(default_factory=list)

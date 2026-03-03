@@ -3,6 +3,13 @@ import json
 from datetime import datetime
 
 DB_NAME = "otto.db"
+DEFAULT_FOLDER = "general"
+
+DEFAULT_SETTINGS = {
+    "active_folder": DEFAULT_FOLDER,
+    "clear_on_capture": "true",
+    "clear_on_answer": "false",
+}
 
 
 def _connect():
@@ -25,8 +32,23 @@ def init_db():
         answer TEXT,
         suggested_mapping TEXT,
         answer_payload TEXT,
+        model_used TEXT,
         confidence REAL,
         confidence_reasons TEXT,
+        created_at TEXT
+    )
+    ''')
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )
+    ''')
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS folders (
+        name TEXT PRIMARY KEY,
         created_at TEXT
     )
     ''')
@@ -42,6 +64,19 @@ def init_db():
 
     if "confidence_reasons" not in existing_columns:
         cursor.execute("ALTER TABLE questions ADD COLUMN confidence_reasons TEXT")
+
+    if "model_used" not in existing_columns:
+        cursor.execute("ALTER TABLE questions ADD COLUMN model_used TEXT")
+
+    for key, value in DEFAULT_SETTINGS.items():
+        cursor.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+            (key, value)
+        )
+    cursor.execute(
+        "INSERT OR IGNORE INTO folders (name, created_at) VALUES (?, ?)",
+        (DEFAULT_FOLDER, datetime.now().isoformat())
+    )
 
     conn.commit()
     conn.close()
@@ -61,10 +96,11 @@ def save_question(q):
         answer,
         suggested_mapping,
         answer_payload,
+        model_used,
         confidence,
         confidence_reasons,
         created_at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     ''', (
         q.id,
         q.path,
@@ -76,6 +112,7 @@ def save_question(q):
         q.answer,
         json.dumps(q.suggested_mapping), 
         json.dumps(q.answer_payload),
+        q.model_used,
         q.confidence,
         json.dumps(q.confidence_reasons),
         datetime.now().isoformat()
@@ -91,6 +128,18 @@ def get_question(q_id):
     conn.close()
     return dict(row) if row else None
 
+
+def question_id_exists(q_id):
+    normalized = str(q_id or "").strip().upper()
+    if not normalized:
+        return False
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM questions WHERE id = ?", (normalized,))
+    exists = cursor.fetchone() is not None
+    conn.close()
+    return exists
+
 def get_latest_question():
     conn = _connect()
     cursor = conn.cursor()
@@ -99,3 +148,298 @@ def get_latest_question():
     row = cursor.fetchone()
     conn.close()
     return dict(row) if row else None
+
+
+def _normalize_folder_name(folder_name):
+    text = str(folder_name or "").strip()
+    if not text:
+        return DEFAULT_FOLDER
+    return text.lower()
+
+
+def create_folder(folder_name):
+    normalized = _normalize_folder_name(folder_name)
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM folders WHERE name = ?", (normalized,))
+    exists = cursor.fetchone() is not None
+    if not exists:
+        cursor.execute(
+            "INSERT INTO folders (name, created_at) VALUES (?, ?)",
+            (normalized, datetime.now().isoformat())
+        )
+    conn.commit()
+    conn.close()
+    return {"name": normalized, "created": not exists}
+
+
+def folder_exists(folder_name):
+    normalized = _normalize_folder_name(folder_name)
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM folders WHERE name = ?", (normalized,))
+    exists = cursor.fetchone() is not None
+    conn.close()
+    return exists
+
+
+def get_active_folder():
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM settings WHERE key = 'active_folder'")
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return DEFAULT_FOLDER
+    return _normalize_folder_name(row["value"])
+
+
+def get_setting(key, default=None):
+    setting_key = str(key or "").strip()
+    if not setting_key:
+        return default
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM settings WHERE key = ?", (setting_key,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return default
+    return row["value"]
+
+
+def set_setting(key, value):
+    setting_key = str(key or "").strip()
+    setting_value = str(value or "").strip()
+    if not setting_key:
+        return None
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+        (setting_key, setting_value)
+    )
+    conn.commit()
+    conn.close()
+    return setting_value
+
+
+def set_active_folder(folder_name, create_if_missing=False):
+    normalized = _normalize_folder_name(folder_name)
+    if not folder_exists(normalized):
+        if not create_if_missing:
+            return None
+        create_folder(normalized)
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES ('active_folder', ?)",
+        (normalized,)
+    )
+    conn.commit()
+    conn.close()
+    return normalized
+
+
+def list_folders_with_counts():
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM folders ORDER BY name")
+    folder_rows = cursor.fetchall()
+
+    cursor.execute("SELECT path, COUNT(*) as cnt FROM questions GROUP BY path")
+    count_rows = cursor.fetchall()
+    count_map = {
+        _normalize_folder_name(row["path"]): int(row["cnt"] or 0)
+        for row in count_rows
+    }
+
+    folders = []
+    for row in folder_rows:
+        folder_name = _normalize_folder_name(row["name"])
+        folders.append({"name": folder_name, "count": count_map.get(folder_name, 0)})
+
+    active_folder = get_active_folder()
+    if not any(item["name"] == active_folder for item in folders):
+        folders.append({"name": active_folder, "count": 0})
+
+    folders.sort(key=lambda item: item["name"])
+    conn.close()
+    return folders
+
+
+def cycle_active_folder():
+    folders = list_folders_with_counts()
+    names = [item["name"] for item in folders]
+    if not names:
+        return set_active_folder(DEFAULT_FOLDER, create_if_missing=True)
+
+    current = get_active_folder()
+    if current not in names:
+        return set_active_folder(names[0], create_if_missing=True)
+
+    current_idx = names.index(current)
+    next_idx = (current_idx + 1) % len(names)
+    return set_active_folder(names[next_idx], create_if_missing=True)
+
+
+def get_questions_by_folder(folder_name, limit=20):
+    normalized = _normalize_folder_name(folder_name)
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM questions WHERE path = ? ORDER BY created_at DESC LIMIT ?",
+        (normalized, int(limit))
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def move_capture_to_folder(question_id, target_folder, create_target=False):
+    qid = str(question_id or "").strip().upper()
+    if not qid:
+        return {"ok": False, "reason": "missing-id"}
+
+    target = _normalize_folder_name(target_folder)
+    if not folder_exists(target):
+        if not create_target:
+            return {"ok": False, "reason": "target-missing", "target": target}
+        create_folder(target)
+
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT path FROM questions WHERE id = ?", (qid,))
+    row = cursor.fetchone()
+    if row is None:
+        conn.close()
+        return {"ok": False, "reason": "missing-capture", "id": qid}
+
+    source = _normalize_folder_name(row["path"])
+    cursor.execute("UPDATE questions SET path = ? WHERE id = ?", (target, qid))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "id": qid, "from": source, "to": target}
+
+
+def delete_capture(question_id):
+    qid = str(question_id or "").strip().upper()
+    if not qid:
+        return {"ok": False, "reason": "missing-id"}
+
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT path FROM questions WHERE id = ?", (qid,))
+    row = cursor.fetchone()
+    if row is None:
+        conn.close()
+        return {"ok": False, "reason": "missing-capture", "id": qid}
+
+    source = _normalize_folder_name(row["path"])
+    cursor.execute("DELETE FROM questions WHERE id = ?", (qid,))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "id": qid, "from": source}
+
+
+def delete_folder(folder_name, force=False, move_to=None):
+    target = _normalize_folder_name(folder_name)
+
+    if target == DEFAULT_FOLDER and not move_to:
+        return {"ok": False, "reason": "protected-default", "folder": target}
+
+    if not folder_exists(target):
+        return {"ok": False, "reason": "missing-folder", "folder": target}
+
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) AS cnt FROM questions WHERE path = ?", (target,))
+    count = int(cursor.fetchone()["cnt"] or 0)
+
+    move_target = None
+    if move_to:
+        move_target = _normalize_folder_name(move_to)
+        if move_target == target:
+            conn.close()
+            return {"ok": False, "reason": "same-target", "folder": target}
+        if not folder_exists(move_target):
+            cursor.execute(
+                "INSERT OR IGNORE INTO folders (name, created_at) VALUES (?, ?)",
+                (move_target, datetime.now().isoformat())
+            )
+
+    if count > 0 and not force and not move_target:
+        conn.close()
+        return {"ok": False, "reason": "not-empty", "folder": target, "count": count}
+
+    moved_count = 0
+    deleted_count = 0
+    if count > 0 and move_target:
+        cursor.execute("UPDATE questions SET path = ? WHERE path = ?", (move_target, target))
+        moved_count = count
+    elif count > 0 and force:
+        cursor.execute("DELETE FROM questions WHERE path = ?", (target,))
+        deleted_count = count
+
+    cursor.execute("SELECT value FROM settings WHERE key = 'active_folder'")
+    active_row = cursor.fetchone()
+    active = _normalize_folder_name(active_row["value"]) if active_row else DEFAULT_FOLDER
+
+    cursor.execute("DELETE FROM folders WHERE name = ?", (target,))
+
+    if active == target:
+        replacement = move_target or DEFAULT_FOLDER
+        cursor.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('active_folder', ?)",
+            (replacement,)
+        )
+        cursor.execute(
+            "INSERT OR IGNORE INTO folders (name, created_at) VALUES (?, ?)",
+            (replacement, datetime.now().isoformat())
+        )
+
+    conn.commit()
+    conn.close()
+    return {
+        "ok": True,
+        "folder": target,
+        "moved_to": move_target,
+        "moved_count": moved_count,
+        "deleted_count": deleted_count,
+    }
+
+
+def rename_folder(old_name, new_name):
+    old_normalized = _normalize_folder_name(old_name)
+    new_normalized = _normalize_folder_name(new_name)
+
+    if old_normalized == new_normalized:
+        return {"ok": False, "reason": "same-name", "old": old_normalized, "new": new_normalized}
+
+    conn = _connect()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT 1 FROM folders WHERE name = ?", (old_normalized,))
+    if cursor.fetchone() is None:
+        conn.close()
+        return {"ok": False, "reason": "old-missing", "old": old_normalized, "new": new_normalized}
+
+    cursor.execute("SELECT 1 FROM folders WHERE name = ?", (new_normalized,))
+    if cursor.fetchone() is not None:
+        conn.close()
+        return {"ok": False, "reason": "new-exists", "old": old_normalized, "new": new_normalized}
+
+    cursor.execute("UPDATE folders SET name = ? WHERE name = ?", (new_normalized, old_normalized))
+    cursor.execute("UPDATE questions SET path = ? WHERE path = ?", (new_normalized, old_normalized))
+
+    cursor.execute("SELECT value FROM settings WHERE key = 'active_folder'")
+    row = cursor.fetchone()
+    if row and _normalize_folder_name(row["value"]) == old_normalized:
+        cursor.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('active_folder', ?)",
+            (new_normalized,)
+        )
+
+    conn.commit()
+    conn.close()
+    return {"ok": True, "old": old_normalized, "new": new_normalized}
