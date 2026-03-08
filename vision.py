@@ -6,6 +6,7 @@ from PIL import Image
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
+from database import get_setting
 
 load_dotenv()
 
@@ -29,11 +30,49 @@ DEFAULT_MODEL_FALLBACKS = [
 
 def get_model_fallbacks():
     override = os.getenv("OTTO_MODEL_FALLBACKS", "").strip()
-    if not override:
-        return DEFAULT_MODEL_FALLBACKS
+    if override:
+        models = [item.strip() for item in override.split(",") if item.strip()]
+        return models or DEFAULT_MODEL_FALLBACKS
 
-    models = [item.strip() for item in override.split(",") if item.strip()]
-    return models or DEFAULT_MODEL_FALLBACKS
+    db_override = str(get_setting("model_fallbacks", "") or "").strip()
+    if db_override:
+        models = [item.strip() for item in db_override.split(",") if item.strip()]
+        return models or DEFAULT_MODEL_FALLBACKS
+
+    return DEFAULT_MODEL_FALLBACKS
+
+
+def probe_models(model_names):
+    probe_image = Image.new("RGB", (4, 4), color=(255, 255, 255))
+    probe_prompt = "Return strict JSON: {\"ok\": true}"
+    results = []
+
+    for model_name in model_names:
+        name = str(model_name or "").strip()
+        if not name:
+            continue
+        try:
+            response = client.models.generate_content(
+                model=name,
+                contents=[probe_prompt, probe_image],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json"
+                )
+            )
+            ok = bool(getattr(response, "text", "").strip())
+            results.append({
+                "model": name,
+                "ok": ok,
+                "error": "" if ok else "Empty response text"
+            })
+        except Exception as exc:
+            results.append({
+                "model": name,
+                "ok": False,
+                "error": str(exc)
+            })
+
+    return results
 
 
 def _inject_model_used(raw_text, model_name):

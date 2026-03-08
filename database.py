@@ -9,6 +9,9 @@ DEFAULT_SETTINGS = {
     "active_folder": DEFAULT_FOLDER,
     "clear_on_capture": "true",
     "clear_on_answer": "false",
+    "clear_on_folder_view": "false",
+    "timeout_minutes": "10",
+    "model_fallbacks": "",
 }
 
 
@@ -210,7 +213,7 @@ def get_setting(key, default=None):
 
 def set_setting(key, value):
     setting_key = str(key or "").strip()
-    setting_value = str(value or "").strip()
+    setting_value = "" if value is None else str(value).strip()
     if not setting_key:
         return None
     conn = _connect()

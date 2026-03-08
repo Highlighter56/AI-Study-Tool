@@ -4,9 +4,9 @@ import time
 import os
 import sys
 from pynput import keyboard
+from database import get_setting
 
 # CONFIGURATION
-TIMEOUT_SECONDS = 600   # 10 minutes
 last_activity = time.time()
 command_in_progress = False
 command_lock = threading.Lock()
@@ -24,15 +24,26 @@ def reset_activity_timer():
     global last_activity
     last_activity = time.time()
 
+
+def get_timeout_seconds():
+    raw = get_setting("timeout_minutes", "10")
+    try:
+        minutes = int(str(raw).strip())
+    except Exception:
+        minutes = 10
+    minutes = max(5, min(30, minutes))
+    return minutes * 60
+
 def monitor_timeout():
-    """Shuts down after 10 minutes of silence."""
+    """Shuts down after configured inactivity timeout."""
     while True:
         time.sleep(10)
         with command_lock:
             is_busy = command_in_progress
         if is_busy:
             continue
-        if time.time() - last_activity > TIMEOUT_SECONDS:
+        timeout_seconds = get_timeout_seconds()
+        if time.time() - last_activity > timeout_seconds:
             print("\n[!] AI-Study-Tool shutting down due to inactivity.")
             clear_pending_console_input()
             os._exit(0)
@@ -133,7 +144,7 @@ print("  Use 'python otto.py settings-show' to view display settings")
 print("  Use 'python otto.py set-folder <name>' to set the active folder by name")
 print("  Use 'python otto.py rename-folder <old> <new>' to rename")
 print("  Alt + Shift + E : Exit")
-print("  (Single command at a time | Auto-exit: 10m)")
+print(f"  (Single command at a time | Auto-exit: {get_timeout_seconds() // 60}m)")
 
 threading.Thread(target=monitor_timeout, daemon=True).start()
 

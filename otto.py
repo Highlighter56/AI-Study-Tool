@@ -1,8 +1,9 @@
 import click
 import json
 import shlex
+import time
 import uuid
-from vision import capture_and_interpret, get_model_fallbacks
+from vision import capture_and_interpret, get_model_fallbacks, DEFAULT_MODEL_FALLBACKS, probe_models
 from database import (
     init_db,
     save_question,
@@ -70,8 +71,10 @@ def print_help_menu():
 
     click.echo("\nSettings:")
     click.echo("  python otto.py settings-show")
-    click.echo("  python otto.py settings-set <clear_on_capture|clear_on_answer> <true|false>")
+    click.echo("  python otto.py settings-set <clear_on_capture|clear_on_answer|clear_on_folder_view> <true|false>")
+    click.echo("  python otto.py settings-set timeout_minutes <5-30>")
     click.echo("  python otto.py show-model-fallbacks")
+    click.echo("  python otto.py probe-models [--apply] [--models comma,separated,list]")
 
     click.echo("\nTip: Use '--help' on any command for detailed options.")
 
@@ -141,12 +144,14 @@ def _generate_unique_question_id(max_attempts=50):
             return candidate
     raise RuntimeError("Unable to generate a unique question ID")
 
+
+def _get_timeout_minutes():
+    raw = get_setting("timeout_minutes", "10")
     try:
-        import sys
-        import termios
-        termios.tcflush(sys.stdin, termios.TCIFLUSH)
+        value = int(str(raw).strip())
     except Exception:
-        pass
+        value = 10
+    return max(5, min(30, value))
 
 
 def _normalize_question_type(raw_type, fallback_classification):
@@ -515,11 +520,56 @@ def show_model_fallbacks_cmd():
         click.echo(f"  {index}. {model_name}")
 
 
+@cli.command(name="probe-models")
+@click.option("--apply", is_flag=True, default=False, help="Save successful models as active fallback order.")
+@click.option("--models", default="", help="Comma-separated model list to probe. Defaults to active fallback list + defaults.")
+def probe_models_cmd(apply, models):
+    provided = [item.strip() for item in str(models or "").split(",") if item.strip()]
+    if provided:
+        probe_list = provided
+    else:
+        seen = set()
+        probe_list = []
+        for name in get_model_fallbacks() + DEFAULT_MODEL_FALLBACKS:
+            if name not in seen:
+                seen.add(name)
+                probe_list.append(name)
+
+    click.echo(click.style(f"Probing {len(probe_list)} model(s)...", fg='cyan', bold=True))
+    results = probe_models(probe_list)
+
+    successes = [row["model"] for row in results if row.get("ok")]
+    failures = [row for row in results if not row.get("ok")]
+
+    if successes:
+        click.echo(click.style("\nAvailable:", fg='green', bold=True))
+        for model_name in successes:
+            click.echo(f"  ✓ {model_name}")
+
+    if failures:
+        click.echo(click.style("\nUnavailable/failed:", fg='yellow', bold=True))
+        for row in failures:
+            err = str(row.get("error") or "Unknown error")
+            click.echo(f"  ✗ {row.get('model')}: {err[:140]}")
+
+    if apply:
+        if not successes:
+            click.echo(click.style("\nNo models succeeded; fallback list not updated.", fg='red', bold=True))
+            return
+        set_setting("model_fallbacks", ",".join(successes))
+        click.echo(click.style("\nUpdated model_fallbacks setting from probe results.", fg='green', bold=True))
+
+
 @cli.command(name="settings-show")
 def settings_show_cmd():
+    name_width = 20
     click.echo(click.style("Settings:", fg='cyan', bold=True))
-    click.echo(f"  clear_on_capture = {get_setting('clear_on_capture', 'true')}")
-    click.echo(f"  clear_on_answer  = {get_setting('clear_on_answer', 'false')}")
+    click.echo(f"  {'clear_on_capture':<{name_width}} = {get_setting('clear_on_capture', 'true')}   (clear terminal before capture output)")
+    click.echo(f"  {'clear_on_answer':<{name_width}} = {get_setting('clear_on_answer', 'false')}   (clear terminal before answer output)")
+    click.echo(f"  {'clear_on_folder_view':<{name_width}} = {get_setting('clear_on_folder_view', 'false')}   (clear before folder list/rotate output)")
+    click.echo(f"  {'timeout_minutes':<{name_width}} = {_get_timeout_minutes()}   (listener + shell inactivity timeout)")
+    model_setting = get_setting("model_fallbacks", "")
+    click.echo(f"  {'model_fallbacks':<{name_width}} = {model_setting if model_setting else '<default order>'}   (comma-separated model order)")
 
 
 @cli.command(name="settings-set")
@@ -527,10 +577,23 @@ def settings_show_cmd():
 @click.argument("value")
 def settings_set_cmd(key, value):
     normalized_key = str(key or "").strip().lower()
-    allowed = {"clear_on_capture", "clear_on_answer"}
-    if normalized_key not in allowed:
+    bool_allowed = {"clear_on_capture", "clear_on_answer", "clear_on_folder_view"}
+    if normalized_key == "timeout_minutes":
+        try:
+            parsed_minutes = int(str(value).strip())
+        except Exception:
+            click.echo(click.style("timeout_minutes must be an integer from 5 to 30.", fg='red', bold=True))
+            return
+        if parsed_minutes < 5 or parsed_minutes > 30:
+            click.echo(click.style("timeout_minutes must be between 5 and 30.", fg='red', bold=True))
+            return
+        saved = set_setting(normalized_key, str(parsed_minutes))
+        click.echo(click.style(f"Updated {normalized_key} = {saved}", fg='green', bold=True))
+        return
+
+    if normalized_key not in bool_allowed:
         click.echo(click.style(
-            "Unsupported setting key. Use clear_on_capture or clear_on_answer.",
+            "Unsupported setting key. Use clear_on_capture, clear_on_answer, clear_on_folder_view, or timeout_minutes.",
             fg='red',
             bold=True
         ))
@@ -547,8 +610,16 @@ def settings_set_cmd(key, value):
 
 @cli.command(name="shell")
 def shell_cmd():
+    timeout_minutes = _get_timeout_minutes()
     click.echo(click.style("Interactive mode. Type 'help' for menu, 'exit' to quit.", fg='cyan', bold=True))
+    click.echo(click.style(f"Auto-timeout: {timeout_minutes} minutes of inactivity.", fg='yellow'))
+    last_activity = time.time()
     while True:
+        timeout_seconds = _get_timeout_minutes() * 60
+        if time.time() - last_activity > timeout_seconds:
+            click.echo(click.style("Shell timed out due to inactivity.", fg='yellow', bold=True))
+            return
+
         try:
             raw = input("otto> ").strip()
         except (EOFError, KeyboardInterrupt):
@@ -557,6 +628,8 @@ def shell_cmd():
 
         if not raw:
             continue
+
+        last_activity = time.time()
 
         lowered = raw.lower()
         if lowered in {"exit", "quit"}:
@@ -589,6 +662,7 @@ def shell_cmd():
 
         try:
             cli.main(args=args, prog_name="otto.py", standalone_mode=False)
+            last_activity = time.time()
         except SystemExit:
             continue
         except click.ClickException as error:
@@ -667,6 +741,9 @@ def list_folders_cmd():
 
 
 def _print_folders_table():
+    if _is_setting_enabled("clear_on_folder_view", default=False):
+        click.clear()
+
     active = get_active_folder()
     folders = list_folders_with_counts()
     if not folders:
