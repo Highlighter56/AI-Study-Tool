@@ -28,11 +28,13 @@ AI-Study-Tool captures on-screen questions, sends them to Gemini for structured 
 
 ## Project Files
 
-- `listener.py`	: global hotkey listener mode
-- `otto.py`		: CLI commands + interactive shell mode
-- `vision.py`	: screenshot + Gemini model fallback pipeline
-- `database.py`	: SQLite schema and data operations
-- `models.py`	: Pydantic model for stored question data
+| File | Purpose |
+| --- | --- |
+| `listener.py` | Global hotkey listener mode |
+| `otto.py` | CLI commands + interactive shell mode |
+| `vision.py` | Screenshot + Gemini model fallback pipeline |
+| `database.py` | SQLite schema and data operations |
+| `models.py` | Pydantic model for stored question data |
 
 ## Requirements
 
@@ -53,7 +55,6 @@ python -m venv .venv
 ```
 
 3. Install dependencies:
-2. Install dependencies:
 
 ```bash
 pip install -r requirements.txt
@@ -151,11 +152,13 @@ python otto.py settings-set timeout_minutes 10
 
 Current configurable settings:
 
-- `clear_on_capture`	: clear terminal before capture output
-- `clear_on_answer`		: clear terminal before answer output
-- `clear_on_folder_view`: clear terminal before folder list/rotate output
-- `timeout_minutes`		: inactivity timeout for listener + shell (`5` to `30`)
-- `model_fallbacks`		: comma-separated fallback model list (managed by probe command)
+| Setting | Description |
+| --- | --- |
+| `clear_on_capture` | Clear terminal before capture output |
+| `clear_on_answer` | Clear terminal before answer output |
+| `clear_on_folder_view` | Clear terminal before folder list/rotate output |
+| `timeout_minutes` | Inactivity timeout for listener + shell (`5` to `30`) |
+| `model_fallbacks` | Comma-separated fallback model list (managed by probe command) |
 
 ## Model Fallbacks
 

@@ -3,4 +3,5 @@ captures/
 __pycache__/
 *.pyc
 helper/
-.db
+*.db
+workingNotes.txt
