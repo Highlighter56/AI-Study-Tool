@@ -4,6 +4,7 @@ import shlex
 import time
 import uuid
 from vision import capture_and_interpret, get_model_fallbacks, DEFAULT_MODEL_FALLBACKS, probe_models
+from settings_utils import get_configured_timeout_minutes
 from database import (
     init_db,
     save_question,
@@ -146,12 +147,7 @@ def _generate_unique_question_id(max_attempts=50):
 
 
 def _get_timeout_minutes():
-    raw = get_setting("timeout_minutes", "10")
-    try:
-        value = int(str(raw).strip())
-    except Exception:
-        value = 10
-    return max(5, min(30, value))
+    return get_configured_timeout_minutes()
 
 
 def _normalize_question_type(raw_type, fallback_classification):

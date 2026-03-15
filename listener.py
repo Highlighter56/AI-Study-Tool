@@ -1,15 +1,16 @@
 import subprocess
 import threading
 import time
-import os
 import sys
 from pynput import keyboard
-from database import get_setting
+from settings_utils import get_configured_timeout_seconds
 
 # CONFIGURATION
 last_activity = time.time()
 command_in_progress = False
 command_lock = threading.Lock()
+shutdown_event = threading.Event()
+listener_handle = None
 
 
 def clear_pending_console_input():
@@ -26,17 +27,23 @@ def reset_activity_timer():
 
 
 def get_timeout_seconds():
-    raw = get_setting("timeout_minutes", "10")
-    try:
-        minutes = int(str(raw).strip())
-    except Exception:
-        minutes = 10
-    minutes = max(5, min(30, minutes))
-    return minutes * 60
+    return get_configured_timeout_seconds()
+
+
+def request_shutdown(message):
+    if shutdown_event.is_set():
+        return
+
+    print(message)
+    clear_pending_console_input()
+    shutdown_event.set()
+
+    if listener_handle is not None:
+        listener_handle.stop()
 
 def monitor_timeout():
     """Shuts down after configured inactivity timeout."""
-    while True:
+    while not shutdown_event.is_set():
         time.sleep(10)
         with command_lock:
             is_busy = command_in_progress
@@ -44,9 +51,7 @@ def monitor_timeout():
             continue
         timeout_seconds = get_timeout_seconds()
         if time.time() - last_activity > timeout_seconds:
-            print("\n[!] AI-Study-Tool shutting down due to inactivity.")
-            clear_pending_console_input()
-            os._exit(0)
+            request_shutdown("\n[!] AI-Study-Tool shutting down due to inactivity.")
 
 def run_command(command_type):
     global command_in_progress
@@ -63,8 +68,12 @@ def run_command(command_type):
         global command_in_progress
         try:
             print(f"\n[!] {label}...")
-            subprocess.run(args)
+            result = subprocess.run(args, check=False)
+            if result.returncode != 0:
+                print(f"[!] {label} failed with exit code {result.returncode}.")
             reset_activity_timer()
+        except Exception as exc:
+            print(f"[!] {label} failed to start: {exc}")
         finally:
             with command_lock:
                 command_in_progress = False
@@ -116,9 +125,7 @@ def run_command(command_type):
             command_in_progress = False
 
 def on_exit():
-    print("\n[!] Exiting AI-Study-Tool.")
-    clear_pending_console_input()
-    os._exit(0)
+    request_shutdown("\n[!] Exiting AI-Study-Tool.")
 
 # Hotkey Map (Alt + Shift + Letter)
 hotkeys_map = {
@@ -149,4 +156,5 @@ print(f"  (Single command at a time | Auto-exit: {get_timeout_seconds() // 60}m)
 threading.Thread(target=monitor_timeout, daemon=True).start()
 
 with keyboard.GlobalHotKeys(hotkeys_map) as h:
+    listener_handle = h
     h.join()
