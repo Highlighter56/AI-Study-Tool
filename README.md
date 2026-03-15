@@ -116,9 +116,9 @@ Notes:
 ## Folder Commands
 
 ```bash
-python otto.py list-folders
+python otto.py list-folders [--list]             # default is tree view; use --list for flat view
 python otto.py current-folder
-python otto.py create-folder [name]
+python otto.py create-folder [name]              # supports nested paths, e.g. unit1/section2
 python otto.py set-folder <name>
 python otto.py cycle-folder
 python otto.py rename-folder <old> <new>

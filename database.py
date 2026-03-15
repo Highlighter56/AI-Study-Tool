@@ -154,23 +154,40 @@ def get_latest_question():
 
 
 def _normalize_folder_name(folder_name):
-    text = str(folder_name or "").strip()
+    text = str(folder_name or "").strip().replace("\\", "/")
     if not text:
         return DEFAULT_FOLDER
-    return text.lower()
+
+    parts = [part.strip().lower() for part in text.split("/") if part.strip() and part.strip() != "."]
+    if not parts:
+        return DEFAULT_FOLDER
+    return "/".join(parts)
+
+
+def _folder_ancestors(folder_name):
+    normalized = _normalize_folder_name(folder_name)
+    parts = normalized.split("/")
+    ancestors = []
+    for index in range(1, len(parts) + 1):
+        ancestors.append("/".join(parts[:index]))
+    return ancestors
 
 
 def create_folder(folder_name):
     normalized = _normalize_folder_name(folder_name)
     conn = _connect()
     cursor = conn.cursor()
+
     cursor.execute("SELECT 1 FROM folders WHERE name = ?", (normalized,))
     exists = cursor.fetchone() is not None
-    if not exists:
+
+    now_text = datetime.now().isoformat()
+    for ancestor in _folder_ancestors(normalized):
         cursor.execute(
-            "INSERT INTO folders (name, created_at) VALUES (?, ?)",
-            (normalized, datetime.now().isoformat())
+            "INSERT OR IGNORE INTO folders (name, created_at) VALUES (?, ?)",
+            (ancestor, now_text)
         )
+
     conn.commit()
     conn.close()
     return {"name": normalized, "created": not exists}
@@ -257,9 +274,14 @@ def list_folders_with_counts():
         for row in count_rows
     }
 
-    folders = []
+    folder_names = set()
     for row in folder_rows:
-        folder_name = _normalize_folder_name(row["name"])
+        folder_names.update(_folder_ancestors(row["name"]))
+    for question_path in count_map.keys():
+        folder_names.update(_folder_ancestors(question_path))
+
+    folders = []
+    for folder_name in folder_names:
         folders.append({"name": folder_name, "count": count_map.get(folder_name, 0)})
 
     active_folder = get_active_folder()
@@ -271,8 +293,42 @@ def list_folders_with_counts():
     return folders
 
 
+def list_folders_tree_with_counts():
+    flat = list_folders_with_counts()
+    by_name = {item["name"]: int(item.get("count") or 0) for item in flat}
+
+    children_map = {}
+    roots = set()
+    for full_name in by_name.keys():
+        parts = full_name.split("/")
+        if len(parts) == 1:
+            roots.add(full_name)
+            continue
+
+        parent = "/".join(parts[:-1])
+        children_map.setdefault(parent, []).append(full_name)
+
+    rows = []
+
+    def walk(node_name):
+        depth = node_name.count("/")
+        rows.append({
+            "name": node_name,
+            "leaf": node_name.split("/")[-1],
+            "depth": depth,
+            "count": by_name.get(node_name, 0),
+        })
+        for child in sorted(children_map.get(node_name, []), key=lambda item: item.split("/")[-1]):
+            walk(child)
+
+    for root_name in sorted(roots, key=lambda item: item.split("/")[-1]):
+        walk(root_name)
+
+    return rows
+
+
 def cycle_active_folder():
-    folders = list_folders_with_counts()
+    folders = list_folders_tree_with_counts()
     names = [item["name"] for item in folders]
     if not names:
         return set_active_folder(DEFAULT_FOLDER, create_if_missing=True)

@@ -18,6 +18,7 @@ from database import (
     get_setting,
     set_setting,
     list_folders_with_counts,
+    list_folders_tree_with_counts,
     cycle_active_folder,
     rename_folder,
     get_questions_by_folder,
@@ -57,9 +58,9 @@ def print_help_menu():
     click.echo("  python otto.py help-menu")
 
     click.echo("\nFolder commands:")
-    click.echo("  python otto.py list-folders")
+    click.echo("  python otto.py list-folders [--list]")
     click.echo("  python otto.py current-folder")
-    click.echo("  python otto.py create-folder [name]")
+    click.echo("  python otto.py create-folder [name]  (supports nested paths, e.g. unit1/section2)")
     click.echo("  python otto.py set-folder <name>")
     click.echo("  python otto.py cycle-folder")
     click.echo("  python otto.py rename-folder <old> <new>")
@@ -732,16 +733,17 @@ def current_folder_cmd():
 
 
 @cli.command(name="list-folders")
-def list_folders_cmd():
-    _print_folders_table()
+@click.option("--list", "show_list", is_flag=True, default=False, help="Show folders in flat list form.")
+def list_folders_cmd(show_list):
+    _print_folders_table(show_tree=not show_list)
 
 
-def _print_folders_table():
+def _print_folders_table(show_tree=False):
     if _is_setting_enabled("clear_on_folder_view", default=False):
         click.clear()
 
     active = get_active_folder()
-    folders = list_folders_with_counts()
+    folders = list_folders_tree_with_counts() if show_tree else list_folders_with_counts()
     if not folders:
         click.echo("No folders found.")
         return
@@ -753,13 +755,32 @@ def _print_folders_table():
         if active_idx >= 0:
             next_name = names[(active_idx + 1) % len(names)]
 
-    click.echo(click.style("Folders:", fg='cyan', bold=True))
-    click.echo("STATUS    NAME                 COUNT")
-    click.echo("--------  -------------------  -----")
+    rendered_rows = []
     for folder in folders:
         folder_name = folder["name"]
+        depth = int(folder.get("depth") or 0)
+        leaf = folder.get("leaf") or folder_name
+        display_name = folder_name
+        if show_tree:
+            indent = "  " * depth
+            display_name = leaf if depth == 0 else f"{indent}/{leaf}"
+        rendered_rows.append({
+            "name": folder_name,
+            "count": int(folder.get("count") or 0),
+            "display": display_name,
+        })
+
+    name_width = max(22, min(70, max(len(row["display"]) for row in rendered_rows)))
+
+    heading = "Folders (tree):" if show_tree else "Folders:"
+    click.echo(click.style(heading, fg='cyan', bold=True))
+    click.echo(f"{'STATUS':<8}  {'NAME':<{name_width}}  COUNT")
+    click.echo(f"{'-' * 8}  {'-' * name_width}  {'-' * 5}")
+    for row in rendered_rows:
+        folder_name = row["name"]
+
         status = ""
-        line = f"{folder_name:<19}  {folder['count']:>5}"
+        line = f"{row['display']:<{name_width}}  {row['count']:>5}"
         if folder_name == active:
             status = "ACTIVE"
             click.echo(click.style(f"{status:<8}  {line}", fg='green', bold=True))
