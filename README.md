@@ -106,6 +106,11 @@ In shell mode, run commands without retyping `python otto.py ...`.
 python otto.py capture
 python otto.py answer [Q_ID]
 python otto.py help-menu
+python otto.py core-help
+python otto.py folder-help
+python otto.py capture-help
+python otto.py settings-help
+python otto.py model-help
 ```
 
 Notes:
@@ -116,21 +121,22 @@ Notes:
 ## Folder Commands
 
 ```bash
-python otto.py list-folders [--list]             # default is tree view; use --list for flat view
-python otto.py current-folder
-python otto.py create-folder [name]              # supports nested paths, e.g. unit1/section2
-python otto.py set-folder <name>
-python otto.py cycle-folder
-python otto.py rename-folder <old> <new>
+python otto.py folder-list [--list]              # default is tree view; use --list for flat view
+python otto.py folder-current
+python otto.py folder-create [name]              # supports nested paths, e.g. unit1/section2
+python otto.py folder-set <name>
+python otto.py folder-cycle
+python otto.py folder-rename <old> <new>
+python otto.py folder-move <source> <target-parent> [--create-target-parent]
+python otto.py folder-delete <name> [--move-to X | --force] [--yes]
 ```
 
 ## Capture Management Commands
 
 ```bash
-python otto.py list-questions [folder] [--limit N]
-python otto.py move-capture <Q_ID> <target-folder> [--create-target]
-python otto.py delete-capture <Q_ID> [--yes]
-python otto.py delete-folder <name> [--move-to X | --force] [--yes]
+python otto.py capture-list [folder] [--limit N]
+python otto.py capture-move <Q_ID> <target-folder> [--create-target]
+python otto.py capture-delete <Q_ID> [--yes]
 ```
 
 ## Settings
@@ -165,15 +171,15 @@ Current configurable settings:
 Show active fallback order:
 
 ```bash
-python otto.py show-model-fallbacks
+python otto.py model-show
 ```
 
 Probe model availability and optionally apply working models:
 
 ```bash
-python otto.py probe-models
-python otto.py probe-models --apply
-python otto.py probe-models --models "modelA,modelB,modelC"  # example
+python otto.py model-probe
+python otto.py model-probe --apply
+python otto.py model-probe --models "modelA,modelB,modelC"  # example
 ```
 
 `--models` accepts any comma-separated model names you want to test.

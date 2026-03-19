@@ -95,21 +95,21 @@ def run_command(command_type):
     elif command_type == "list_folders":
         threading.Thread(
             target=worker,
-            args=([sys.executable, "otto.py", "list-folders"], "Showing folders"),
+            args=([sys.executable, "otto.py", "folder-list"], "Showing folders"),
             daemon=True
         ).start()
 
     elif command_type == "cycle_folder":
         threading.Thread(
             target=worker,
-            args=([sys.executable, "otto.py", "cycle-folder"], "Cycling folder"),
+            args=([sys.executable, "otto.py", "folder-cycle"], "Cycling folder"),
             daemon=True
         ).start()
 
     elif command_type == "create_folder":
         threading.Thread(
             target=worker,
-            args=([sys.executable, "otto.py", "create-folder"], "Creating folder"),
+            args=([sys.executable, "otto.py", "folder-create"], "Creating folder"),
             daemon=True
         ).start()
 
@@ -148,8 +148,8 @@ print("  Alt + Shift + H : Help menu")
 print("  Use 'python otto.py help-menu' for full command reference")
 print("  Use 'python otto.py shell' for interactive text commands")
 print("  Use 'python otto.py settings-show' to view display settings")
-print("  Use 'python otto.py set-folder <name>' to set the active folder by name")
-print("  Use 'python otto.py rename-folder <old> <new>' to rename")
+print("  Use 'python otto.py folder-set <name>' to set the active folder by name")
+print("  Use 'python otto.py folder-rename <old> <new>' to rename")
 print("  Alt + Shift + E : Exit")
 print(f"  (Single command at a time | Auto-exit: {get_timeout_seconds() // 60}m)")
 

@@ -412,20 +412,31 @@ def delete_folder(folder_name, force=False, move_to=None):
 
     conn = _connect()
     cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) AS cnt FROM questions WHERE path = ?", (target,))
+    cursor.execute(
+        "SELECT name FROM folders WHERE name = ? OR name LIKE ? ORDER BY LENGTH(name) DESC",
+        (target, target + "/%")
+    )
+    subtree_folders = [str(row["name"]) for row in cursor.fetchall()]
+
+    cursor.execute(
+        "SELECT COUNT(*) AS cnt FROM questions WHERE path = ? OR path LIKE ?",
+        (target, target + "/%")
+    )
     count = int(cursor.fetchone()["cnt"] or 0)
 
     move_target = None
     if move_to:
         move_target = _normalize_folder_name(move_to)
-        if move_target == target:
+        if _is_descendant_path(move_target, target):
             conn.close()
             return {"ok": False, "reason": "same-target", "folder": target}
         if not folder_exists(move_target):
-            cursor.execute(
-                "INSERT OR IGNORE INTO folders (name, created_at) VALUES (?, ?)",
-                (move_target, datetime.now().isoformat())
-            )
+            now_text = datetime.now().isoformat()
+            for ancestor in _folder_ancestors(move_target):
+                cursor.execute(
+                    "INSERT OR IGNORE INTO folders (name, created_at) VALUES (?, ?)",
+                    (ancestor, now_text)
+                )
 
     if count > 0 and not force and not move_target:
         conn.close()
@@ -434,19 +445,28 @@ def delete_folder(folder_name, force=False, move_to=None):
     moved_count = 0
     deleted_count = 0
     if count > 0 and move_target:
-        cursor.execute("UPDATE questions SET path = ? WHERE path = ?", (move_target, target))
-        moved_count = count
+        cursor.execute(
+            "SELECT path FROM questions WHERE path = ? OR path LIKE ?",
+            (target, target + "/%")
+        )
+        question_paths = sorted({str(row["path"]) for row in cursor.fetchall()}, key=len, reverse=True)
+        for old_path in question_paths:
+            suffix = old_path[len(target):]
+            new_path = move_target + suffix
+            cursor.execute("UPDATE questions SET path = ? WHERE path = ?", (new_path, old_path))
+            moved_count += int(cursor.rowcount or 0)
     elif count > 0 and force:
-        cursor.execute("DELETE FROM questions WHERE path = ?", (target,))
+        cursor.execute("DELETE FROM questions WHERE path = ? OR path LIKE ?", (target, target + "/%"))
         deleted_count = count
 
     cursor.execute("SELECT value FROM settings WHERE key = 'active_folder'")
     active_row = cursor.fetchone()
     active = _normalize_folder_name(active_row["value"]) if active_row else DEFAULT_FOLDER
 
-    cursor.execute("DELETE FROM folders WHERE name = ?", (target,))
+    for folder_path in subtree_folders:
+        cursor.execute("DELETE FROM folders WHERE name = ?", (folder_path,))
 
-    if active == target:
+    if _is_descendant_path(active, target):
         replacement = move_target or DEFAULT_FOLDER
         cursor.execute(
             "INSERT OR REPLACE INTO settings (key, value) VALUES ('active_folder', ?)",
@@ -465,6 +485,117 @@ def delete_folder(folder_name, force=False, move_to=None):
         "moved_to": move_target,
         "moved_count": moved_count,
         "deleted_count": deleted_count,
+    }
+
+
+def _is_descendant_path(path_value, parent_value):
+    if not parent_value:
+        return False
+    return path_value == parent_value or path_value.startswith(parent_value + "/")
+
+
+def move_folder(source_folder, target_parent, create_target_parent=False):
+    source = _normalize_folder_name(source_folder)
+    parent_text = str(target_parent or "").strip().replace("\\", "/")
+    target_parent_normalized = ""
+    if parent_text not in {"", "/", "."}:
+        target_parent_normalized = _normalize_folder_name(parent_text)
+
+    if source == DEFAULT_FOLDER:
+        return {"ok": False, "reason": "protected-default", "folder": source}
+
+    source_leaf = source.split("/")[-1]
+    destination = f"{target_parent_normalized}/{source_leaf}" if target_parent_normalized else source_leaf
+
+    if destination == source:
+        return {"ok": False, "reason": "same-target", "source": source, "target": destination}
+
+    if target_parent_normalized and _is_descendant_path(target_parent_normalized, source):
+        return {"ok": False, "reason": "target-inside-source", "source": source, "target_parent": target_parent_normalized}
+
+    conn = _connect()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT 1 FROM folders WHERE name = ?", (source,))
+    if cursor.fetchone() is None:
+        conn.close()
+        return {"ok": False, "reason": "source-missing", "source": source}
+
+    if target_parent_normalized:
+        cursor.execute("SELECT 1 FROM folders WHERE name = ?", (target_parent_normalized,))
+        parent_exists = cursor.fetchone() is not None
+        if not parent_exists:
+            if not create_target_parent:
+                conn.close()
+                return {"ok": False, "reason": "target-parent-missing", "target_parent": target_parent_normalized}
+            now_text = datetime.now().isoformat()
+            for ancestor in _folder_ancestors(target_parent_normalized):
+                cursor.execute(
+                    "INSERT OR IGNORE INTO folders (name, created_at) VALUES (?, ?)",
+                    (ancestor, now_text)
+                )
+
+    cursor.execute("SELECT 1 FROM folders WHERE name = ?", (destination,))
+    if cursor.fetchone() is not None:
+        conn.close()
+        return {"ok": False, "reason": "name-conflict", "target": destination}
+
+    cursor.execute(
+        "SELECT name FROM folders WHERE name = ? OR name LIKE ? ORDER BY LENGTH(name) ASC",
+        (source, source + "/%")
+    )
+    source_rows = [str(row["name"]) for row in cursor.fetchall()]
+    if not source_rows:
+        conn.close()
+        return {"ok": False, "reason": "source-missing", "source": source}
+
+    mapping = []
+    for old_name in source_rows:
+        suffix = old_name[len(source):]
+        new_name = destination + suffix
+        mapping.append((old_name, new_name))
+
+    target_names = {new_name for _, new_name in mapping}
+    for new_name in target_names:
+        cursor.execute("SELECT 1 FROM folders WHERE name = ?", (new_name,))
+        row = cursor.fetchone()
+        if row is not None and new_name not in source_rows:
+            conn.close()
+            return {"ok": False, "reason": "name-conflict", "target": new_name}
+
+    tmp_prefix = f"__tmp_move__{int(datetime.now().timestamp() * 1000)}__"
+    for old_name, _ in mapping:
+        cursor.execute("UPDATE folders SET name = ? WHERE name = ?", (tmp_prefix + old_name, old_name))
+
+    for old_name, new_name in mapping:
+        cursor.execute("UPDATE folders SET name = ? WHERE name = ?", (new_name, tmp_prefix + old_name))
+
+    moved_questions = 0
+    for old_name, new_name in mapping:
+        cursor.execute("UPDATE questions SET path = ? WHERE path = ?", (new_name, old_name))
+        moved_questions += int(cursor.rowcount or 0)
+
+    cursor.execute("SELECT value FROM settings WHERE key = 'active_folder'")
+    active_row = cursor.fetchone()
+    if active_row:
+        active = _normalize_folder_name(active_row["value"])
+        if _is_descendant_path(active, source):
+            active_suffix = active[len(source):]
+            active_replacement = destination + active_suffix
+            cursor.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES ('active_folder', ?)",
+                (active_replacement,)
+            )
+
+    conn.commit()
+    conn.close()
+    return {
+        "ok": True,
+        "source": source,
+        "target_parent": target_parent_normalized,
+        "destination": destination,
+        "moved_folders": len(mapping),
+        "moved_questions": moved_questions,
     }
 
 
@@ -488,16 +619,48 @@ def rename_folder(old_name, new_name):
         conn.close()
         return {"ok": False, "reason": "new-exists", "old": old_normalized, "new": new_normalized}
 
-    cursor.execute("UPDATE folders SET name = ? WHERE name = ?", (new_normalized, old_normalized))
-    cursor.execute("UPDATE questions SET path = ? WHERE path = ?", (new_normalized, old_normalized))
+    cursor.execute(
+        "SELECT name FROM folders WHERE name = ? OR name LIKE ? ORDER BY LENGTH(name) ASC",
+        (old_normalized, old_normalized + "/%")
+    )
+    source_rows = [str(row["name"]) for row in cursor.fetchall()]
+    if not source_rows:
+        conn.close()
+        return {"ok": False, "reason": "old-missing", "old": old_normalized, "new": new_normalized}
+
+    mapping = []
+    for old_path in source_rows:
+        suffix = old_path[len(old_normalized):]
+        mapping.append((old_path, new_normalized + suffix))
+
+    target_names = {new_path for _, new_path in mapping}
+    for new_path in target_names:
+        cursor.execute("SELECT 1 FROM folders WHERE name = ?", (new_path,))
+        row = cursor.fetchone()
+        if row is not None and new_path not in source_rows:
+            conn.close()
+            return {"ok": False, "reason": "new-exists", "old": old_normalized, "new": new_normalized}
+
+    tmp_prefix = f"__tmp_rename__{int(datetime.now().timestamp() * 1000)}__"
+    for old_path, _ in mapping:
+        cursor.execute("UPDATE folders SET name = ? WHERE name = ?", (tmp_prefix + old_path, old_path))
+
+    for old_path, new_path in mapping:
+        cursor.execute("UPDATE folders SET name = ? WHERE name = ?", (new_path, tmp_prefix + old_path))
+
+    for old_path, new_path in mapping:
+        cursor.execute("UPDATE questions SET path = ? WHERE path = ?", (new_path, old_path))
 
     cursor.execute("SELECT value FROM settings WHERE key = 'active_folder'")
     row = cursor.fetchone()
-    if row and _normalize_folder_name(row["value"]) == old_normalized:
-        cursor.execute(
-            "INSERT OR REPLACE INTO settings (key, value) VALUES ('active_folder', ?)",
-            (new_normalized,)
-        )
+    if row:
+        active = _normalize_folder_name(row["value"])
+        if _is_descendant_path(active, old_normalized):
+            active_suffix = active[len(old_normalized):]
+            cursor.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES ('active_folder', ?)",
+                (new_normalized + active_suffix,)
+            )
 
     conn.commit()
     conn.close()

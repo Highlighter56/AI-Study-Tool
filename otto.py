@@ -20,6 +20,7 @@ from database import (
     list_folders_with_counts,
     list_folders_tree_with_counts,
     cycle_active_folder,
+    move_folder,
     rename_folder,
     get_questions_by_folder,
     move_capture_to_folder,
@@ -40,8 +41,9 @@ QUESTION_TYPE_LABELS = {
 }
 
 
-def print_help_menu():
-    click.echo(click.style("\nAI-Study-Tool Help", fg='cyan', bold=True))
+def print_core_help(include_title=True):
+    if include_title:
+        click.echo(click.style("\nCore commands:", fg='cyan', bold=True))
     click.echo("\nHotkeys (listener mode):")
     click.echo("  Alt + Shift + Q : Capture")
     click.echo("  Alt + Shift + A : Answer (displays answer to latest captured question)")
@@ -57,26 +59,61 @@ def print_help_menu():
     click.echo("  python otto.py shell             (interactive text-command mode)")
     click.echo("  python otto.py help-menu")
 
-    click.echo("\nFolder commands:")
-    click.echo("  python otto.py list-folders [--list]")
-    click.echo("  python otto.py current-folder")
-    click.echo("  python otto.py create-folder [name]  (supports nested paths, e.g. unit1/section2)")
-    click.echo("  python otto.py set-folder <name>")
-    click.echo("  python otto.py cycle-folder")
-    click.echo("  python otto.py rename-folder <old> <new>")
 
-    click.echo("\nCapture management:")
-    click.echo("  python otto.py list-questions [folder] [--limit N]   (--limit is optional)")
-    click.echo("  python otto.py move-capture <Q_ID> <target-folder> [--create-target]")
-    click.echo("  python otto.py delete-capture <Q_ID> [--yes]")
-    click.echo("  python otto.py delete-folder <name> [--move-to X | --force] [--yes]")
+def print_folder_help(include_title=True):
+    if include_title:
+        click.echo(click.style("\nFolder commands:", fg='cyan', bold=True))
+    click.echo("  python otto.py folder-list [--list]")
+    click.echo("  python otto.py folder-current")
+    click.echo("  python otto.py folder-create [name]  (supports nested paths, e.g. unit1/section2)")
+    click.echo("  python otto.py folder-set <name>")
+    click.echo("  python otto.py folder-cycle")
+    click.echo("  python otto.py folder-rename <old> <new>")
+    click.echo("  python otto.py folder-move <source> <target-parent> [--create-target-parent]")
+    click.echo("  python otto.py folder-delete <name> [--move-to X | --force] [--yes]")
 
-    click.echo("\nSettings:")
+
+def print_capture_help(include_title=True):
+    if include_title:
+        click.echo(click.style("\nCapture commands:", fg='cyan', bold=True))
+    click.echo("  python otto.py capture")
+    click.echo("  python otto.py answer [Q_ID]")
+    click.echo("  python otto.py capture-list [folder] [--limit N]")
+    click.echo("  python otto.py capture-move <Q_ID> <target-folder> [--create-target]")
+    click.echo("  python otto.py capture-delete <Q_ID> [--yes]")
+
+
+def print_settings_help(include_title=True):
+    if include_title:
+        click.echo(click.style("\nSettings commands:", fg='cyan', bold=True))
     click.echo("  python otto.py settings-show")
     click.echo("  python otto.py settings-set <clear_on_capture|clear_on_answer|clear_on_folder_view> <true|false>")
     click.echo("  python otto.py settings-set timeout_minutes <5-30>")
-    click.echo("  python otto.py show-model-fallbacks")
-    click.echo("  python otto.py probe-models [--apply] [--models comma,separated,list]")
+
+
+def print_model_help(include_title=True):
+    if include_title:
+        click.echo(click.style("\nModel commands:", fg='cyan', bold=True))
+    click.echo("  python otto.py model-show")
+    click.echo("  python otto.py model-probe [--apply] [--models comma,separated,list]")
+
+
+def print_help_menu():
+    click.echo(click.style("\nAI-Study-Tool Help", fg='cyan', bold=True))
+    
+    click.echo(click.style("\nHelp commands:", fg='cyan', bold=True))
+    click.echo("  python otto.py help-menu                 (show this menu)")
+    click.echo("  python otto.py core-help                 (core commands)")
+    click.echo("  python otto.py folder-help               (folder commands)")
+    click.echo("  python otto.py capture-help              (capture commands)")
+    click.echo("  python otto.py settings-help             (settings commands)")
+    click.echo("  python otto.py model-help                (model commands)")
+    
+    print_core_help()
+    print_folder_help()
+    print_capture_help()
+    print_settings_help()
+    print_model_help()
 
     click.echo("\nTip: Use '--help' on any command for detailed options.")
 
@@ -509,7 +546,32 @@ def help_menu_cmd():
     print_help_menu()
 
 
-@cli.command(name="show-model-fallbacks")
+@cli.command(name="core-help")
+def core_help_cmd():
+    print_core_help()
+
+
+@cli.command(name="folder-help")
+def folder_help_cmd():
+    print_folder_help()
+
+
+@cli.command(name="capture-help")
+def capture_help_cmd():
+    print_capture_help()
+
+
+@cli.command(name="settings-help")
+def settings_help_cmd():
+    print_settings_help()
+
+
+@cli.command(name="model-help")
+def model_help_cmd():
+    print_model_help()
+
+
+@cli.command(name="model-show")
 def show_model_fallbacks_cmd():
     fallbacks = get_model_fallbacks()
     click.echo(click.style("Model fallbacks (in order):", fg='cyan', bold=True))
@@ -517,7 +579,7 @@ def show_model_fallbacks_cmd():
         click.echo(f"  {index}. {model_name}")
 
 
-@cli.command(name="probe-models")
+@cli.command(name="model-probe")
 @click.option("--apply", is_flag=True, default=False, help="Save successful models as active fallback order.")
 @click.option("--models", default="", help="Comma-separated model list to probe. Defaults to active fallback list + defaults.")
 def probe_models_cmd(apply, models):
@@ -668,18 +730,18 @@ def shell_cmd():
             click.echo(click.style(f"Command error: {error}", fg='red'))
 
 
-@cli.command(name="set-folder")
+@cli.command(name="folder-set")
 @click.argument("folder_name")
 def set_folder_cmd(folder_name):
     folder = set_active_folder(folder_name, create_if_missing=False)
     if not folder:
         click.echo(click.style(f"Folder does not exist: {folder_name}", fg='red', bold=True))
-        click.echo("Use create-folder first, then set-folder.")
+        click.echo("Use folder-create first, then folder-set.")
         return
     click.echo(click.style(f"Active folder set to: {folder}", fg='green', bold=True))
 
 
-@cli.command(name="create-folder")
+@cli.command(name="folder-create")
 @click.argument("folder_name", required=False)
 def create_folder_cmd(folder_name):
     if folder_name:
@@ -700,7 +762,7 @@ def create_folder_cmd(folder_name):
         click.echo(click.style(f"Folder already exists: {result['name']}. Try another name.", fg='red'))
 
 
-@cli.command(name="rename-folder")
+@cli.command(name="folder-rename")
 @click.argument("old_name")
 @click.argument("new_name")
 def rename_folder_cmd(old_name, new_name):
@@ -726,16 +788,55 @@ def rename_folder_cmd(old_name, new_name):
     ))
 
 
-@cli.command(name="current-folder")
+@cli.command(name="folder-current")
 def current_folder_cmd():
     folder = get_active_folder()
     click.echo(click.style(f"Current folder: {folder}", fg='blue', bold=True))
 
 
-@cli.command(name="list-folders")
+@cli.command(name="folder-list")
 @click.option("--list", "show_list", is_flag=True, default=False, help="Show folders in flat list form.")
 def list_folders_cmd(show_list):
     _print_folders_table(show_tree=not show_list)
+
+
+@cli.command(name="folder-move")
+@click.argument("source_folder")
+@click.argument("target_parent")
+@click.option("--create-target-parent", is_flag=True, default=False, help="Create target parent path if missing.")
+def move_folder_cmd(source_folder, target_parent, create_target_parent):
+    result = move_folder(source_folder, target_parent, create_target_parent=create_target_parent)
+    if not result.get("ok"):
+        reason = result.get("reason")
+        if reason == "protected-default":
+            click.echo(click.style("Cannot move the default folder.", fg='red', bold=True))
+            return
+        if reason == "source-missing":
+            click.echo(click.style(f"Source folder not found: {result.get('source')}", fg='red', bold=True))
+            return
+        if reason == "target-parent-missing":
+            click.echo(click.style(f"Target parent not found: {result.get('target_parent')}", fg='red', bold=True))
+            click.echo("Use --create-target-parent to create the parent path.")
+            return
+        if reason == "target-inside-source":
+            click.echo(click.style("Cannot move a folder into itself or its descendants.", fg='red', bold=True))
+            return
+        if reason == "same-target":
+            click.echo(click.style("Folder is already at that location.", fg='yellow', bold=True))
+            return
+        if reason == "name-conflict":
+            click.echo(click.style(f"Name conflict at destination: {result.get('target')}", fg='red', bold=True))
+            click.echo("Rename the source folder first or pick a different target parent.")
+            return
+        click.echo(click.style("Could not move folder.", fg='red', bold=True))
+        return
+
+    click.echo(click.style(
+        f"Moved folder {result.get('source')} -> {result.get('destination')}",
+        fg='green',
+        bold=True
+    ))
+    click.echo(f"Updated {result.get('moved_folders')} folder path(s) and {result.get('moved_questions')} capture path(s).")
 
 
 def _print_folders_table(show_tree=False):
@@ -791,7 +892,7 @@ def _print_folders_table(show_tree=False):
             click.echo(f"{'':<8}  {line}")
 
 
-@cli.command(name="list-questions")
+@cli.command(name="capture-list")
 @click.argument("folder_name", required=False)
 @click.option("--limit", default=20, show_default=True, type=int)
 def list_questions_cmd(folder_name, limit):
@@ -810,7 +911,7 @@ def list_questions_cmd(folder_name, limit):
         click.echo(f"- [{qid}] ({qtype}) {preview}")
 
 
-@cli.command(name="move-capture")
+@cli.command(name="capture-move")
 @click.argument("q_id")
 @click.argument("target_folder")
 @click.option("--create-target", is_flag=True, default=False, help="Create target folder if missing.")
@@ -838,7 +939,7 @@ def move_capture_cmd(q_id, target_folder, create_target):
     ))
 
 
-@cli.command(name="delete-capture")
+@cli.command(name="capture-delete")
 @click.argument("q_id")
 @click.option("--yes", is_flag=True, default=False, help="Skip confirmation prompt.")
 def delete_capture_cmd(q_id, yes):
@@ -867,7 +968,7 @@ def delete_capture_cmd(q_id, yes):
     ))
 
 
-@cli.command(name="delete-folder")
+@cli.command(name="folder-delete")
 @click.argument("folder_name")
 @click.option("--yes", is_flag=True, default=False, help="Skip confirmation prompt.")
 @click.option("--move-to", default=None, help="Move folder captures to another folder before deleting.")
@@ -917,7 +1018,7 @@ def delete_folder_cmd(folder_name, yes, move_to, force):
         click.echo(f"Deleted {deleted_count} capture(s).")
 
 
-@cli.command(name="cycle-folder")
+@cli.command(name="folder-cycle")
 def cycle_folder_cmd():
     next_folder = cycle_active_folder()
     click.echo(click.style(f"Active folder switched to: {next_folder}", fg='green', bold=True))
