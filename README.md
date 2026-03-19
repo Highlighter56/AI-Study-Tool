@@ -78,6 +78,7 @@ Hotkeys:
 
 - `Alt+Shift+Q`: capture question/screen
 - `Alt+Shift+A`: display answer for latest capture
+- `Alt+Shift+G`: generate study material from active folder tree
 - `Alt+Shift+K`: create folder
 - `Alt+Shift+F`: show folders
 - `Alt+Shift+R`: rotate active folder + show folders
@@ -111,6 +112,7 @@ python otto.py folder-help
 python otto.py capture-help
 python otto.py settings-help
 python otto.py model-help
+python otto.py study-help
 ```
 
 Notes:
@@ -138,6 +140,26 @@ python otto.py capture-list [folder] [--limit N]
 python otto.py capture-move <Q_ID> <target-folder> [--create-target]
 python otto.py capture-delete <Q_ID> [--yes]
 ```
+
+## Study Commands
+
+```bash
+python otto.py study-help
+python otto.py study-generate
+python otto.py study-generate --interactive             # aliases: --customize, -i, -c
+python otto.py study-generate --folder general --format md
+python otto.py study-generate --question-count 25       # generate about this many questions
+python otto.py study-generate --mcq-only --question-order random
+python otto.py study-generate --title "Unit 2 Review" --open
+```
+
+`study-generate` notes:
+
+- Default output format is Markdown (`md`).
+- Omit `--question-count` for auto target selection (still capped at `60`).
+- Interactive mode supports `?`, `list`, or `folder-list` in the folder prompt to show the folder tree.
+- Generated files include an AI safety notice at the top.
+- `--open` is enabled by default (`--no-open` disables auto-open).
 
 ## Settings
 
@@ -204,5 +226,6 @@ This project is actively evolving. Current implementation is stable for:
 - folder-based organization
 - model fallback tracking and probing
 - settings-driven output/timeouts
+- study material generation (markdown/text, interactive setup, folder tree sourcing)
 
-Planned features include study-material generation by folder, richer review workflows, and additional capture controls.
+Planned features include richer review workflows, feedback correction loops, and additional capture controls.

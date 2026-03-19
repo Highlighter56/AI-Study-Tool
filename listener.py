@@ -2,6 +2,7 @@ import subprocess
 import threading
 import time
 import sys
+import os
 from pynput import keyboard
 from settings_utils import get_configured_timeout_seconds
 
@@ -68,7 +69,9 @@ def run_command(command_type):
         global command_in_progress
         try:
             print(f"\n[!] {label}...")
-            result = subprocess.run(args, check=False)
+            env = os.environ.copy()
+            env["OTTO_RUN_MODE"] = "listener"
+            result = subprocess.run(args, check=False, env=env)
             if result.returncode != 0:
                 print(f"[!] {label} failed with exit code {result.returncode}.")
             reset_activity_timer()
@@ -120,6 +123,13 @@ def run_command(command_type):
             daemon=True
         ).start()
 
+    elif command_type == "study_generate":
+        threading.Thread(
+            target=worker,
+            args=([sys.executable, "otto.py", "study-generate"], "Generating study material"),
+            daemon=True
+        ).start()
+
     else:
         with command_lock:
             command_in_progress = False
@@ -134,6 +144,7 @@ hotkeys_map = {
     '<alt>+<shift>+f': lambda: run_command("list_folders"),
     '<alt>+<shift>+r': lambda: run_command("cycle_folder"),
     '<alt>+<shift>+k': lambda: run_command("create_folder"),
+    '<alt>+<shift>+g': lambda: run_command("study_generate"),
     '<alt>+<shift>+h': lambda: run_command("help_menu"),
     '<alt>+<shift>+e': on_exit
 }
@@ -144,6 +155,7 @@ print("  Alt + Shift + A : Answer")
 print("  Alt + Shift + F : Show folders")
 print("  Alt + Shift + R : Rotate active folder")
 print("  Alt + Shift + K : Create a folder")
+print("  Alt + Shift + G : Generate study material")
 print("  Alt + Shift + H : Help menu")
 print("  Use 'python otto.py help-menu' for full command reference")
 print("  Use 'python otto.py shell' for interactive text commands")

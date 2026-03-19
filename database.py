@@ -1,5 +1,6 @@
 import sqlite3
 import json
+import random
 from datetime import datetime
 
 DB_NAME = "otto.db"
@@ -353,6 +354,36 @@ def get_questions_by_folder(folder_name, limit=20):
     rows = cursor.fetchall()
     conn.close()
     return [dict(row) for row in rows]
+
+
+def get_questions_for_study(folder_name, order_mode="grouped", limit=None):
+    normalized = _normalize_folder_name(folder_name)
+    mode = str(order_mode or "grouped").strip().lower()
+
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM questions WHERE path = ? OR path LIKE ?",
+        (normalized, normalized + "/%")
+    )
+    rows = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    if mode == "capture":
+        rows.sort(key=lambda row: str(row.get("created_at") or ""))
+    elif mode == "random":
+        random.shuffle(rows)
+    else:
+        rows.sort(key=lambda row: (str(row.get("path") or ""), str(row.get("created_at") or "")))
+
+    if limit is not None:
+        try:
+            limited = max(0, int(limit))
+        except Exception:
+            limited = 0
+        rows = rows[:limited]
+
+    return rows
 
 
 def move_capture_to_folder(question_id, target_folder, create_target=False):

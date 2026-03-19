@@ -1,9 +1,12 @@
 import click
 import json
+import os
 import shlex
+import sys
 import time
 import uuid
-from vision import capture_and_interpret, get_model_fallbacks, DEFAULT_MODEL_FALLBACKS, probe_models
+from datetime import datetime
+from vision import capture_and_interpret, get_model_fallbacks, DEFAULT_MODEL_FALLBACKS, probe_models, client
 from settings_utils import get_configured_timeout_minutes
 from database import (
     init_db,
@@ -23,6 +26,7 @@ from database import (
     move_folder,
     rename_folder,
     get_questions_by_folder,
+    get_questions_for_study,
     move_capture_to_folder,
     delete_capture,
     delete_folder,
@@ -40,6 +44,22 @@ QUESTION_TYPE_LABELS = {
     "OTHER": "Other"
 }
 
+AI_WARNING_TEXT = (
+    "AI-Generated Notice: This output may contain errors or omissions. "
+    "Verify important information with trusted sources."
+)
+
+STUDY_QUESTION_TYPES = {
+    "multiple_choice",
+    "true_false",
+    "short_answer",
+    "fill_in_the_blank",
+    "ordering",
+    "categorization",
+}
+
+_runtime_mode = str(os.getenv("OTTO_RUN_MODE", "direct") or "direct").strip().lower()
+
 
 def print_core_help(include_title=True):
     if include_title:
@@ -50,12 +70,14 @@ def print_core_help(include_title=True):
     click.echo("  Alt + Shift + F : Show folders")
     click.echo("  Alt + Shift + R : Rotate active folder + show folders")
     click.echo("  Alt + Shift + K : Create folder")
+    click.echo("  Alt + Shift + G : Generate study guide")
     click.echo("  Alt + Shift + H : Show help menu")
     click.echo("  Alt + Shift + E : Exit listener")
 
     click.echo("\nCore commands:")
     click.echo("  python otto.py capture")
     click.echo("  python otto.py answer [Q_ID]     (Q_ID is optional)")
+    click.echo("  python otto.py study-generate")
     click.echo("  python otto.py shell             (interactive text-command mode)")
     click.echo("  python otto.py help-menu")
 
@@ -98,6 +120,19 @@ def print_model_help(include_title=True):
     click.echo("  python otto.py model-probe [--apply] [--models comma,separated,list]")
 
 
+def print_study_help(include_title=True):
+    if include_title:
+        click.echo(click.style("\nStudy commands:", fg='cyan', bold=True))
+    click.echo("  python otto.py study-generate [--folder NAME] [--format md|txt|both]")
+    click.echo("    Generate a study guide + optional practice questions from a folder tree.")
+    click.echo("  python otto.py study-generate --interactive   (aliases: --customize, -i, -c)")
+    click.echo("    In interactive mode folder prompt supports '?', 'list', or 'folder-list' to show tree.")
+    click.echo("  python otto.py study-generate --question-count 25   (generate about this many questions)")
+    click.echo("    Omit --question-count for auto target (hard cap 60).")
+    click.echo("  python otto.py study-generate --mcq-only")
+    click.echo("  python otto.py study-generate --question-order grouped|capture|random")
+
+
 def print_help_menu():
     click.echo(click.style("\nAI-Study-Tool Help", fg='cyan', bold=True))
     
@@ -108,12 +143,14 @@ def print_help_menu():
     click.echo("  python otto.py capture-help              (capture commands)")
     click.echo("  python otto.py settings-help             (settings commands)")
     click.echo("  python otto.py model-help                (model commands)")
+    click.echo("  python otto.py study-help                (study generation commands)")
     
     print_core_help()
     print_folder_help()
     print_capture_help()
     print_settings_help()
     print_model_help()
+    print_study_help()
 
     click.echo("\nTip: Use '--help' on any command for detailed options.")
 
@@ -186,6 +223,467 @@ def _generate_unique_question_id(max_attempts=50):
 
 def _get_timeout_minutes():
     return get_configured_timeout_minutes()
+
+
+def _set_runtime_mode(mode):
+    global _runtime_mode
+    candidate = str(mode or "").strip().lower()
+    _runtime_mode = candidate if candidate in {"listener", "shell", "direct"} else "direct"
+
+
+def _get_runtime_mode():
+    return _runtime_mode if _runtime_mode in {"listener", "shell", "direct"} else "direct"
+
+
+def _print_followup_hints():
+    mode = _get_runtime_mode()
+    if mode == "listener":
+        click.echo("Press Alt+Shift+A to reveal solution.")
+        click.echo("Press Alt+Shift+F to show folder list.")
+        click.echo("Press Alt+Shift+R to rotate folder.")
+        click.echo("Press Alt+Shift+G to generate study material.")
+        return
+
+    if mode == "shell":
+        click.echo("Try: answer")
+        click.echo("Try: folder-list")
+        click.echo("Try: folder-cycle")
+        click.echo("Try: study-generate")
+        return
+
+    click.echo("Try: python otto.py answer")
+    click.echo("Try: python otto.py folder-list")
+    click.echo("Try: python otto.py folder-cycle")
+    click.echo("Try: python otto.py study-generate")
+
+
+def _read_shell_input_with_timeout(prompt_text, timeout_seconds, poll_seconds=0.10, history=None):
+    try:
+        import msvcrt
+    except Exception:
+        # Fallback for non-Windows environments.
+        return input(prompt_text), False
+
+    sys.stdout.write(prompt_text)
+    sys.stdout.flush()
+
+    deadline = time.time() + max(1.0, float(timeout_seconds))
+    chars = []
+    history_items = history if isinstance(history, list) else []
+    history_index = len(history_items)
+    rendered_len = len(prompt_text)
+
+    def redraw():
+        nonlocal rendered_len
+        current_text = prompt_text + "".join(chars)
+        current_len = len(current_text)
+        pad = max(0, rendered_len - current_len)
+        sys.stdout.write("\r")
+        sys.stdout.write(current_text)
+        if pad:
+            sys.stdout.write(" " * pad)
+        sys.stdout.write("\r")
+        sys.stdout.write(current_text)
+        sys.stdout.flush()
+        rendered_len = current_len
+
+    while True:
+        if time.time() > deadline:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            return "", True
+
+        if msvcrt.kbhit():
+            ch = msvcrt.getwch()
+            deadline = time.time() + max(1.0, float(timeout_seconds))
+
+            if ch in {"\r", "\n"}:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return "".join(chars), False
+
+            if ch == "\003":
+                raise KeyboardInterrupt()
+
+            if ch == "\b":
+                if chars:
+                    chars.pop()
+                    sys.stdout.write("\b \b")
+                    sys.stdout.flush()
+                continue
+
+            if ch in {"\xe0", "\x00"}:
+                special = msvcrt.getwch()
+                if special == "H" and history_items:
+                    # Up arrow
+                    history_index = max(0, history_index - 1)
+                    chars = list(history_items[history_index])
+                    redraw()
+                elif special == "P" and history_items:
+                    # Down arrow
+                    history_index = min(len(history_items), history_index + 1)
+                    if history_index == len(history_items):
+                        chars = []
+                    else:
+                        chars = list(history_items[history_index])
+                    redraw()
+                continue
+
+            if ch.isprintable():
+                chars.append(ch)
+                sys.stdout.write(ch)
+                sys.stdout.flush()
+            continue
+
+        time.sleep(poll_seconds)
+
+
+def _safe_json_loads(raw_text, fallback):
+    if isinstance(raw_text, (dict, list)):
+        return raw_text
+    try:
+        parsed = json.loads(raw_text)
+        return parsed if parsed is not None else fallback
+    except Exception:
+        return fallback
+
+
+def _normalize_study_question_types(raw_types, mcq_only=False):
+    if mcq_only:
+        return ["multiple_choice"]
+
+    items = [item.strip().lower() for item in str(raw_types or "").split(",") if item.strip()]
+    normalized = []
+    for item in items:
+        candidate = item.replace("-", "_").replace(" ", "_")
+        if candidate in STUDY_QUESTION_TYPES and candidate not in normalized:
+            normalized.append(candidate)
+    return normalized or [
+        "multiple_choice",
+        "true_false",
+        "short_answer",
+        "fill_in_the_blank",
+        "ordering",
+        "categorization",
+    ]
+
+
+def _sanitize_filename_piece(value):
+    text = str(value or "").strip().replace("\\", "-").replace("/", "-")
+    cleaned = []
+    for ch in text:
+        if ch.isalnum() or ch in {"-", "_"}:
+            cleaned.append(ch)
+    normalized = "".join(cleaned).strip("-_")
+    return normalized or "study"
+
+
+def _resolve_unique_output_base(base_path, fmt):
+    wanted = str(fmt or "md").strip().lower()
+    extensions = [".txt", ".md"] if wanted == "both" else [f".{wanted}"]
+
+    def collides(candidate_base):
+        for ext in extensions:
+            if os.path.exists(candidate_base + ext):
+                return True
+        return False
+
+    candidate = base_path
+    if not collides(candidate):
+        return candidate
+
+    suffix = 1
+    while True:
+        next_candidate = f"{base_path}_{suffix}"
+        if not collides(next_candidate):
+            return next_candidate
+        suffix += 1
+
+
+def _open_generated_file(path_value):
+    target = os.path.abspath(path_value)
+    try:
+        if os.name == "nt":
+            os.startfile(target)  # type: ignore[attr-defined]
+            return True, ""
+    except Exception as exc:
+        last_error = str(exc)
+    else:
+        last_error = ""
+
+    try:
+        click.launch(target)
+        return True, ""
+    except Exception as exc:
+        if not last_error:
+            last_error = str(exc)
+        return False, last_error
+
+
+def _study_depth_instruction(depth):
+    mode = str(depth or "moderate").strip().lower()
+    if mode == "refresher":
+        return "Keep summaries concise and focused on quick recall."
+    if mode == "indepth":
+        return "Provide deeper conceptual explanation, common pitfalls, and detail-rich coverage."
+    return "Provide balanced detail suitable for typical exam preparation."
+
+
+def _resolve_question_limit(source_count, requested_limit=None):
+    total = max(0, int(source_count or 0))
+    auto_target = min(60, max(5, int(round(total * 0.75))))
+
+    if requested_limit is None:
+        return auto_target
+
+    try:
+        parsed = int(requested_limit)
+    except Exception:
+        return auto_target
+
+    if parsed <= 0:
+        return auto_target
+    return min(60, max(1, parsed))
+
+
+def _build_study_prompt(folder_name, rows, include_summary, include_questions, question_types, depth, answer_key, title_hint="", question_limit=None):
+    source_items = []
+    for row in rows:
+        options = _safe_json_loads(row.get("options"), [])
+        context = str(row.get("context") or "").strip()
+        source_items.append({
+            "id": str(row.get("id") or ""),
+            "folder": str(row.get("path") or ""),
+            "question": str(row.get("question_text") or ""),
+            "question_type": str(row.get("question_type") or "OTHER"),
+            "answer": str(row.get("answer") or ""),
+            "context": context,
+            "options": options if isinstance(options, list) else [],
+            "created_at": str(row.get("created_at") or ""),
+        })
+
+    max_questions = _resolve_question_limit(len(source_items), requested_limit=question_limit) if include_questions else 0
+    prompt_payload = {
+        "target_folder": folder_name,
+        "title_hint": str(title_hint or "").strip(),
+        "ai_warning": AI_WARNING_TEXT,
+        "depth": depth,
+        "depth_instruction": _study_depth_instruction(depth),
+        "include_summary": include_summary,
+        "include_questions": include_questions,
+        "question_types": question_types,
+        "max_questions": max_questions,
+        "target_question_count": max_questions,
+        "answer_key_required": bool(answer_key and include_questions),
+        "source_items": source_items,
+    }
+
+    return f"""
+You are generating study material from previously captured educational questions.
+
+Return strict JSON only. No markdown fences and no extra commentary.
+
+Required schema:
+{{
+  "title": "string",
+  "overview": "string",
+  "sections": [
+    {{
+      "heading": "string",
+      "summary": "string",
+      "key_points": ["string"]
+    }}
+  ],
+  "practice_questions": [
+    {{
+      "id": "Q1",
+      "type": "multiple_choice|true_false|short_answer|fill_in_the_blank|ordering|categorization",
+      "question": "string",
+      "options": ["string"],
+      "answer": "string",
+      "explanation": "string",
+      "source_folder": "string"
+    }}
+  ]
+}}
+
+Rules:
+- If include_summary is false, return empty overview and empty sections array.
+- If include_questions is false, return empty practice_questions array.
+- Only use question types from question_types list.
+- Aim to generate target_question_count questions and never exceed max_questions.
+- Ensure answer and explanation exist for every generated practice question.
+- Keep content educational, concrete, and aligned to provided source_items.
+
+Input JSON:
+{json.dumps(prompt_payload, ensure_ascii=True)}
+""".strip()
+
+
+def _generate_study_payload(prompt_text):
+    model_fallbacks = get_model_fallbacks()
+    last_error = ""
+
+    for model_name in model_fallbacks:
+        try:
+            response = client.models.generate_content(model=model_name, contents=[prompt_text])
+            payload = _parse_json_response(str(getattr(response, "text", "") or ""))
+            if isinstance(payload, dict):
+                payload["model_used"] = model_name
+                return payload
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+
+    raise RuntimeError(last_error or "All configured models failed to generate study content.")
+
+
+def _render_study_markdown(payload, include_summary=True, include_questions=True, answer_key=True):
+    title = str(payload.get("title") or "Study Guide").strip() or "Study Guide"
+    overview = str(payload.get("overview") or "").strip()
+    sections = payload.get("sections") if isinstance(payload.get("sections"), list) else []
+    questions = payload.get("practice_questions") if isinstance(payload.get("practice_questions"), list) else []
+
+    lines = [f"# {title}", "", f"> {AI_WARNING_TEXT}", ""]
+    lines.append(f"Generated: {datetime.now().isoformat(timespec='seconds')}")
+    lines.append("")
+
+    if include_summary and (overview or sections):
+        lines.append("## Summary")
+        lines.append("")
+        if overview:
+            lines.append(overview)
+            lines.append("")
+        for section in sections:
+            heading = str(section.get("heading") or "Topic").strip() or "Topic"
+            summary = str(section.get("summary") or "").strip()
+            key_points = section.get("key_points") if isinstance(section.get("key_points"), list) else []
+            lines.append(f"### {heading}")
+            if summary:
+                lines.append(summary)
+            for point in key_points:
+                point_text = str(point).strip()
+                if point_text:
+                    lines.append(f"- {point_text}")
+            lines.append("")
+
+    if include_questions and questions:
+        lines.append("## Practice Questions")
+        lines.append("")
+        for idx, item in enumerate(questions, start=1):
+            prompt = str(item.get("question") or "").strip()
+            qtype = str(item.get("type") or "").strip().replace("_", " ").title()
+            lines.append(f"### Q{idx}. {prompt}")
+            if qtype:
+                lines.append(f"Type: {qtype}")
+            options = item.get("options") if isinstance(item.get("options"), list) else []
+            for opt_index, option in enumerate(options, start=1):
+                option_text = str(option).strip()
+                if option_text:
+                    lines.append(f"{opt_index}. {option_text}")
+            lines.append("")
+
+    if include_questions and answer_key and questions:
+        lines.append("## Answer Key")
+        lines.append("")
+        lines.append(f"> {AI_WARNING_TEXT}")
+        lines.append("")
+        for idx, item in enumerate(questions, start=1):
+            answer = str(item.get("answer") or "").strip() or "(not provided)"
+            explanation = str(item.get("explanation") or "").strip()
+            lines.append(f"- Q{idx}: {answer}")
+            if explanation:
+                lines.append(f"  Explanation: {explanation}")
+        lines.append("")
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def _render_study_text(payload, include_summary=True, include_questions=True, answer_key=True):
+    title = str(payload.get("title") or "Study Guide").strip() or "Study Guide"
+    overview = str(payload.get("overview") or "").strip()
+    sections = payload.get("sections") if isinstance(payload.get("sections"), list) else []
+    questions = payload.get("practice_questions") if isinstance(payload.get("practice_questions"), list) else []
+
+    lines = [title, "=" * len(title), "", AI_WARNING_TEXT, "", f"Generated: {datetime.now().isoformat(timespec='seconds')}", ""]
+
+    if include_summary and (overview or sections):
+        lines.extend(["SUMMARY", "-------"])
+        if overview:
+            lines.extend([overview, ""])
+        for section in sections:
+            heading = str(section.get("heading") or "Topic").strip() or "Topic"
+            summary = str(section.get("summary") or "").strip()
+            key_points = section.get("key_points") if isinstance(section.get("key_points"), list) else []
+            lines.append(f"{heading}:")
+            if summary:
+                lines.append(f"  {summary}")
+            for point in key_points:
+                point_text = str(point).strip()
+                if point_text:
+                    lines.append(f"  - {point_text}")
+            lines.append("")
+
+    if include_questions and questions:
+        lines.extend(["PRACTICE QUESTIONS", "------------------"])
+        for idx, item in enumerate(questions, start=1):
+            prompt = str(item.get("question") or "").strip()
+            qtype = str(item.get("type") or "").strip().replace("_", " ").title()
+            lines.append(f"Q{idx}. {prompt}")
+            if qtype:
+                lines.append(f"Type: {qtype}")
+            options = item.get("options") if isinstance(item.get("options"), list) else []
+            for opt_index, option in enumerate(options, start=1):
+                option_text = str(option).strip()
+                if option_text:
+                    lines.append(f"  {opt_index}. {option_text}")
+            lines.append("")
+
+    if include_questions and answer_key and questions:
+        lines.extend(["ANSWER KEY", "----------", AI_WARNING_TEXT, ""])
+        for idx, item in enumerate(questions, start=1):
+            answer = str(item.get("answer") or "").strip() or "(not provided)"
+            explanation = str(item.get("explanation") or "").strip()
+            lines.append(f"Q{idx}: {answer}")
+            if explanation:
+                lines.append(f"  Explanation: {explanation}")
+            lines.append("")
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def _write_study_outputs(payload, folder_name, output_base, fmt, include_summary, include_questions, answer_key, title_hint=""):
+    os.makedirs("captures", exist_ok=True)
+
+    if output_base:
+        raw_base = os.path.splitext(output_base)[0]
+        base_path = raw_base
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        folder_piece = _sanitize_filename_piece(folder_name)
+        filename_title = _sanitize_filename_piece(title_hint) if str(title_hint or "").strip() else _sanitize_filename_piece(payload.get("title", ""))
+        if filename_title and filename_title != "study":
+            base_path = os.path.join("captures", f"study_material_{filename_title}_{folder_piece}_{timestamp}")
+        else:
+            base_path = os.path.join("captures", f"study_material_{folder_piece}_{timestamp}")
+
+    base_path = _resolve_unique_output_base(base_path, fmt)
+
+    generated = []
+
+    if fmt in {"txt", "both"}:
+        txt_path = base_path if base_path.lower().endswith(".txt") else f"{base_path}.txt"
+        with open(txt_path, "w", encoding="utf-8") as handle:
+            handle.write(_render_study_text(payload, include_summary, include_questions, answer_key))
+        generated.append(txt_path)
+
+    if fmt in {"md", "both"}:
+        md_path = base_path if base_path.lower().endswith(".md") else f"{base_path}.md"
+        with open(md_path, "w", encoding="utf-8") as handle:
+            handle.write(_render_study_markdown(payload, include_summary, include_questions, answer_key))
+        generated.append(md_path)
+
+    return generated
 
 
 def _normalize_question_type(raw_type, fallback_classification):
@@ -571,6 +1069,11 @@ def model_help_cmd():
     print_model_help()
 
 
+@cli.command(name="study-help")
+def study_help_cmd():
+    print_study_help()
+
+
 @cli.command(name="model-show")
 def show_model_fallbacks_cmd():
     fallbacks = get_model_fallbacks()
@@ -667,20 +1170,244 @@ def settings_set_cmd(key, value):
     click.echo(click.style(f"Updated {normalized_key} = {saved}", fg='green', bold=True))
 
 
+@cli.command(name="study-generate")
+@click.option("--folder", "folder_name", default="", help="Source folder. Defaults to active folder.")
+@click.option("--format", "fmt", type=click.Choice(["txt", "md", "both"], case_sensitive=False), default="md", show_default=True)
+@click.option("--output", "output_base", default="", help="Output base path (without extension) or full file path.")
+@click.option("--title", "title_hint", default="", help="Optional title to guide generated study guide heading.")
+@click.option("--open/--no-open", "open_output", default=True, show_default=True, help="Open generated file after creation.")
+@click.option("--include-summary/--no-summary", default=True, show_default=True)
+@click.option("--include-questions/--no-questions", default=True, show_default=True)
+@click.option("--question-types", default="multiple_choice,true_false,short_answer,fill_in_the_blank,ordering,categorization", show_default=True)
+@click.option("--mcq-only", is_flag=True, default=False, help="Shortcut for --question-types multiple_choice.")
+@click.option("--question-order", type=click.Choice(["grouped", "capture", "random"], case_sensitive=False), default="grouped", show_default=True)
+@click.option(
+    "--question-count",
+    "--max-questions",
+    "question_count",
+    type=int,
+    default=None,
+    help="Generate this many practice questions. Omit for auto target (hard cap 60)."
+)
+@click.option("--depth", type=click.Choice(["refresher", "moderate", "indepth"], case_sensitive=False), default="moderate", show_default=True)
+@click.option("--answer-key/--no-answer-key", default=True, show_default=True)
+@click.option("--interactive", "interactive", is_flag=True, default=False, help="Interactive setup mode.")
+@click.option("--customize", "customize", is_flag=True, default=False, help="Alias for --interactive.")
+@click.option("-i", "interactive_short", is_flag=True, default=False, help="Short alias for --interactive.")
+@click.option("-c", "customize_short", is_flag=True, default=False, help="Short alias for --interactive.")
+def study_generate_cmd(
+    folder_name,
+    fmt,
+    output_base,
+    title_hint,
+    open_output,
+    include_summary,
+    include_questions,
+    question_types,
+    mcq_only,
+    question_order,
+    question_count,
+    depth,
+    answer_key,
+    interactive,
+    customize,
+    interactive_short,
+    customize_short,
+):
+    interactive_mode = bool(interactive or customize or interactive_short or customize_short)
+    target_folder = (folder_name or "").strip() or get_active_folder()
+    selected_format = str(fmt or "md").lower()
+    selected_order = str(question_order or "grouped").lower()
+    selected_depth = str(depth or "moderate").lower()
+    selected_title = str(title_hint or "").strip()
+    selected_question_count = int(question_count) if question_count is not None else None
+
+    if interactive_mode:
+        click.echo(click.style("Interactive study generation setup", fg='cyan', bold=True))
+        click.echo(click.style("This wizard asks about 8-12 prompts depending your choices.", fg='cyan'))
+        click.echo("You can enter '?', 'list', or 'folder-list' to view folder tree before choosing.")
+        while True:
+            proposed_folder = click.prompt("Folder", default=target_folder, show_default=True).strip()
+            lowered = proposed_folder.lower()
+            if lowered in {"?", "list", "folder-list"}:
+                _print_folders_table(show_tree=True)
+                continue
+            if folder_exists(proposed_folder):
+                target_folder = proposed_folder
+                break
+            click.echo(click.style(f"Folder does not exist: {proposed_folder}", fg='red', bold=True))
+
+        selected_format = click.prompt(
+            "Output format",
+            default=selected_format,
+            show_default=True,
+            type=click.Choice(["txt", "md", "both"], case_sensitive=False),
+        ).lower()
+        selected_title = click.prompt(
+            "Study guide title (blank for auto)",
+            default=selected_title,
+            show_default=False,
+        ).strip()
+
+        include_summary = click.confirm("Include summary section?", default=include_summary)
+        include_questions = click.confirm("Include practice questions?", default=include_questions)
+
+        if include_questions:
+            answer_key = click.confirm("Include answer key?", default=answer_key)
+        else:
+            answer_key = False
+
+        if include_summary:
+            selected_depth = click.prompt(
+                "Summary depth",
+                default=selected_depth,
+                show_default=True,
+                type=click.Choice(["refresher", "moderate", "indepth"], case_sensitive=False),
+            ).lower()
+
+        if include_questions:
+            mcq_only = click.confirm("MCQ only mode?", default=mcq_only)
+            if not mcq_only:
+                question_types = click.prompt(
+                    "Question types (comma-separated)",
+                    default=question_types,
+                    show_default=True,
+                )
+            selected_order = click.prompt(
+                "Question order",
+                default=selected_order,
+                show_default=True,
+                type=click.Choice(["grouped", "capture", "random"], case_sensitive=False),
+            ).lower()
+            default_count_text = "" if selected_question_count is None else str(selected_question_count)
+            while True:
+                raw_count = click.prompt(
+                    "Question count (blank = auto target, hard cap 60)",
+                    default=default_count_text,
+                    show_default=False,
+                ).strip()
+                if not raw_count:
+                    selected_question_count = None
+                    break
+                try:
+                    parsed_count = int(raw_count)
+                except Exception:
+                    click.echo(click.style("Question count must be a whole number or blank.", fg='red', bold=True))
+                    continue
+                if parsed_count <= 0:
+                    click.echo(click.style("Question count must be at least 1, or blank for auto.", fg='red', bold=True))
+                    continue
+                selected_question_count = parsed_count
+                break
+
+        output_base = click.prompt(
+            "Output path base (blank for auto, e.g. captures/unit1_midterm)",
+            default=output_base,
+            show_default=False,
+        ).strip()
+        open_output = click.confirm("Open generated file after save?", default=open_output)
+
+        if not click.confirm("Generate study guide now?", default=True):
+            click.echo("Cancelled.")
+            return
+
+    if not folder_exists(target_folder):
+        click.echo(click.style(f"Folder does not exist: {target_folder}", fg='red', bold=True))
+        click.echo("Use folder-create first, then rerun study-generate.")
+        return
+
+    if not include_summary and not include_questions:
+        click.echo(click.style("Nothing to generate: enable summary and/or questions.", fg='red', bold=True))
+        return
+
+    if selected_question_count is not None and selected_question_count <= 0:
+        click.echo(click.style("--question-count must be 1 or greater when provided.", fg='red', bold=True))
+        return
+
+    selected_types = _normalize_study_question_types(question_types, mcq_only=mcq_only)
+    if mcq_only and str(question_types or "").strip():
+        click.echo(click.style("--mcq-only enabled; ignoring --question-types.", fg='yellow'))
+
+    rows = get_questions_for_study(target_folder, order_mode=selected_order)
+    if not rows:
+        click.echo(click.style(f"No captures found in folder tree: {target_folder}", fg='yellow', bold=True))
+        return
+
+    question_cap = _resolve_question_limit(len(rows), requested_limit=selected_question_count) if include_questions else 0
+    if include_questions and selected_question_count is None:
+        cap_message = f"Source captures: {len(rows)} | Question target: {question_cap} (auto target, hard cap 60; model may return fewer)"
+    elif include_questions:
+        cap_message = f"Source captures: {len(rows)} | Question target: {question_cap} (manual target, hard cap 60; model may return fewer)"
+    else:
+        cap_message = f"Source captures: {len(rows)}"
+    click.echo(click.style(cap_message, fg='cyan'))
+
+    prompt_text = _build_study_prompt(
+        folder_name=target_folder,
+        rows=rows,
+        include_summary=include_summary,
+        include_questions=include_questions,
+        question_types=selected_types,
+        depth=selected_depth,
+        answer_key=answer_key,
+        title_hint=selected_title,
+        question_limit=selected_question_count,
+    )
+
+    click.echo(click.style("Generating study material...", fg='cyan', bold=True))
+    try:
+        payload = _generate_study_payload(prompt_text)
+    except Exception as exc:
+        click.echo(click.style(f"Study generation failed: {exc}", fg='red', bold=True))
+        return
+
+    try:
+        output_files = _write_study_outputs(
+            payload=payload,
+            folder_name=target_folder,
+            output_base=output_base,
+            fmt=selected_format,
+            include_summary=include_summary,
+            include_questions=include_questions,
+            answer_key=answer_key,
+            title_hint=selected_title,
+        )
+    except Exception as exc:
+        click.echo(click.style(f"Could not write study output files: {exc}", fg='red', bold=True))
+        return
+
+    click.echo(click.style("Study material generated.", fg='green', bold=True))
+    click.echo(click.style(f"Model Used: {payload.get('model_used', 'unknown')}", fg='white'))
+    click.echo(click.style(AI_WARNING_TEXT, fg='yellow', bold=True))
+    for file_path in output_files:
+        click.echo(f"Saved: {file_path}")
+
+    if open_output and output_files:
+        preferred = None
+        for file_path in output_files:
+            if file_path.lower().endswith(".md"):
+                preferred = file_path
+                break
+        target = preferred or output_files[0]
+        ok, error_message = _open_generated_file(target)
+        if not ok:
+            click.echo(click.style(f"Could not open generated file: {error_message}", fg='yellow'))
+
+
 @cli.command(name="shell")
 def shell_cmd():
     timeout_minutes = _get_timeout_minutes()
     click.echo(click.style("Interactive mode. Type 'help' for menu, 'exit' to quit.", fg='cyan', bold=True))
     click.echo(click.style(f"Auto-timeout: {timeout_minutes} minutes of inactivity.", fg='yellow'))
-    last_activity = time.time()
+    command_history = []
     while True:
         timeout_seconds = _get_timeout_minutes() * 60
-        if time.time() - last_activity > timeout_seconds:
-            click.echo(click.style("Shell timed out due to inactivity.", fg='yellow', bold=True))
-            return
-
         try:
-            raw = input("otto> ").strip()
+            raw, timed_out = _read_shell_input_with_timeout("otto> ", timeout_seconds, history=command_history)
+            if timed_out:
+                click.echo(click.style("Shell timed out due to inactivity.", fg='yellow', bold=True))
+                return
+            raw = str(raw or "").strip()
         except (EOFError, KeyboardInterrupt):
             click.echo("\nExiting shell.")
             return
@@ -688,7 +1415,10 @@ def shell_cmd():
         if not raw:
             continue
 
-        last_activity = time.time()
+        if not command_history or command_history[-1] != raw:
+            command_history.append(raw)
+            if len(command_history) > 200:
+                command_history = command_history[-200:]
 
         lowered = raw.lower()
         if lowered in {"exit", "quit"}:
@@ -720,14 +1450,17 @@ def shell_cmd():
             continue
 
         try:
+            previous_mode = _get_runtime_mode()
+            _set_runtime_mode("shell")
             cli.main(args=args, prog_name="otto.py", standalone_mode=False)
-            last_activity = time.time()
         except SystemExit:
             continue
         except click.ClickException as error:
             error.show()
         except Exception as error:
             click.echo(click.style(f"Command error: {error}", fg='red'))
+        finally:
+            _set_runtime_mode(previous_mode)
 
 
 @cli.command(name="folder-set")
@@ -1022,7 +1755,7 @@ def delete_folder_cmd(folder_name, yes, move_to, force):
 def cycle_folder_cmd():
     next_folder = cycle_active_folder()
     click.echo(click.style(f"Active folder switched to: {next_folder}", fg='green', bold=True))
-    _print_folders_table()
+    _print_folders_table(show_tree=True)
 
 @cli.command()
 def capture():
@@ -1088,6 +1821,7 @@ def capture():
         conf_percent = int(question.confidence * 100)
         click.echo(click.style(f"AI Confidence: {conf_percent}%", fg='magenta', bold=True))
         click.echo(click.style(f"Model Used: {question.model_used}", fg='white'))
+        click.echo(click.style(AI_WARNING_TEXT, fg='yellow', bold=True))
         _display_confidence_reasons(question.confidence_reasons)
         
         # 3. Question
@@ -1098,9 +1832,7 @@ def capture():
         click.echo(click.style("CONTEXT:", fg='cyan', underline=True))
         click.echo(question.context)
         click.echo("_" * 50)
-        click.echo(f"Press Alt+Shift+A to reveal solution.")
-        click.echo("Press Alt+Shift+F to show folder list.")
-        click.echo("Press Alt+Shift+R to rotate folder.")
+        _print_followup_hints()
         click.echo(clipboard_note)
         
     except Exception as e:
@@ -1176,6 +1908,7 @@ def answer(q_id):
     # Confidence Score (Purple/Magenta)
     click.echo(click.style(f"AI Confidence: {int(conf * 100)}%", fg='magenta', bold=True))
     click.echo(click.style(f"Model Used: {model_used}", fg='white'))
+    click.echo(click.style(AI_WARNING_TEXT, fg='yellow', bold=True))
     _display_confidence_reasons(confidence_reasons)
 
     _display_answer(question_type, ans, answer_payload, mapping, options)
