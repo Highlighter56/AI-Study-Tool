@@ -95,7 +95,7 @@ def _inject_model_used(raw_text, model_name):
         return json.dumps(payload)
     return raw_text
 
-def capture_and_interpret():
+def capture_and_interpret(correction_context=""):
     try:
         # 1. Capture full screen
         with mss.mss() as sct:
@@ -147,6 +147,10 @@ def capture_and_interpret():
                 - Use 1.0 only for perfectly clear text and unambiguous answer.
                 - Slight blur/partial occlusion/ambiguity should reduce confidence significantly.
         """
+
+        correction_notes = str(correction_context or "").strip()
+        if correction_notes:
+            prompt += "\n\nUser correction history to prioritize:\n" + correction_notes + "\n"
 
         # 2. Iterative Model Fallback
         model_fallbacks = get_model_fallbacks()

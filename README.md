@@ -79,6 +79,8 @@ Hotkeys:
 - `Alt+Shift+Q`: capture question/screen
 - `Alt+Shift+A`: display answer for latest capture
 - `Alt+Shift+G`: generate study material from active folder tree
+- `Alt+Shift+Y`: mark latest capture as correct
+- `Alt+Shift+X`: mark latest capture as incorrect (with correction prompt)
 - `Alt+Shift+K`: create folder
 - `Alt+Shift+F`: show folders
 - `Alt+Shift+R`: rotate active folder + show folders
@@ -113,6 +115,7 @@ python otto.py capture-help
 python otto.py settings-help
 python otto.py model-help
 python otto.py study-help
+python otto.py feedback-help
 ```
 
 Notes:
@@ -160,6 +163,22 @@ python otto.py study-generate --title "Unit 2 Review" --open
 - Interactive mode supports `?`, `list`, or `folder-list` in the folder prompt to show the folder tree.
 - Generated files include an AI safety notice at the top.
 - `--open` is enabled by default (`--no-open` disables auto-open).
+
+## Feedback Commands
+
+```bash
+python otto.py feedback-help
+python otto.py feedback-mark --type capture --status correct
+python otto.py feedback-mark --type capture --status incorrect --interactive
+python otto.py feedback-mark SQABC123 --type study --status incorrect --corrected-answer "..."
+python otto.py feedback-list --limit 20
+python otto.py feedback-list --folder general --status incorrect
+```
+
+Notes:
+
+- Study questions are saved with stable IDs in generated outputs, e.g. `Q1 [SQXXXXXXX]`, so they can be corrected later.
+- Feedback entries are stored in SQLite and used as compact correction context for future capture/study generation prompts.
 
 ## Settings
 

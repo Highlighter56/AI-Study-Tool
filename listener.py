@@ -68,6 +68,7 @@ def run_command(command_type):
     def worker(args, label):
         global command_in_progress
         try:
+            clear_pending_console_input()
             print(f"\n[!] {label}...")
             env = os.environ.copy()
             env["OTTO_RUN_MODE"] = "listener"
@@ -78,6 +79,7 @@ def run_command(command_type):
         except Exception as exc:
             print(f"[!] {label} failed to start: {exc}")
         finally:
+            clear_pending_console_input()
             with command_lock:
                 command_in_progress = False
 
@@ -130,12 +132,29 @@ def run_command(command_type):
             daemon=True
         ).start()
 
+    elif command_type == "feedback_yes":
+        threading.Thread(
+            target=worker,
+            args=([sys.executable, "otto.py", "feedback-mark", "--type", "capture", "--status", "correct"], "Saving feedback (correct)"),
+            daemon=True
+        ).start()
+
+    elif command_type == "feedback_no":
+        threading.Thread(
+            target=worker,
+            args=([sys.executable, "otto.py", "feedback-mark", "--type", "capture", "--status", "incorrect", "--interactive"], "Saving feedback (incorrect)"),
+            daemon=True
+        ).start()
+
     else:
         with command_lock:
             command_in_progress = False
 
 def on_exit():
+    clear_pending_console_input()
     request_shutdown("\n[!] Exiting AI-Study-Tool.")
+    time.sleep(0.05)
+    clear_pending_console_input()
 
 # Hotkey Map (Alt + Shift + Letter)
 hotkeys_map = {
@@ -145,6 +164,8 @@ hotkeys_map = {
     '<alt>+<shift>+r': lambda: run_command("cycle_folder"),
     '<alt>+<shift>+k': lambda: run_command("create_folder"),
     '<alt>+<shift>+g': lambda: run_command("study_generate"),
+    '<alt>+<shift>+y': lambda: run_command("feedback_yes"),
+    '<alt>+<shift>+x': lambda: run_command("feedback_no"),
     '<alt>+<shift>+h': lambda: run_command("help_menu"),
     '<alt>+<shift>+e': on_exit
 }
@@ -156,6 +177,8 @@ print("  Alt + Shift + F : Show folders")
 print("  Alt + Shift + R : Rotate active folder")
 print("  Alt + Shift + K : Create a folder")
 print("  Alt + Shift + G : Generate study material")
+print("  Alt + Shift + Y : Mark latest capture as correct")
+print("  Alt + Shift + X : Mark latest capture as incorrect (with correction prompt)")
 print("  Alt + Shift + H : Help menu")
 print("  Use 'python otto.py help-menu' for full command reference")
 print("  Use 'python otto.py shell' for interactive text commands")

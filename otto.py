@@ -30,6 +30,13 @@ from database import (
     move_capture_to_folder,
     delete_capture,
     delete_folder,
+    save_study_run,
+    update_study_run_outputs,
+    get_latest_study_run,
+    get_study_questions,
+    save_feedback,
+    list_feedback,
+    get_feedback_for_prompt,
 )
 from models import OttoQuestion
 
@@ -71,6 +78,8 @@ def print_core_help(include_title=True):
     click.echo("  Alt + Shift + R : Rotate active folder + show folders")
     click.echo("  Alt + Shift + K : Create folder")
     click.echo("  Alt + Shift + G : Generate study guide")
+    click.echo("  Alt + Shift + Y : Mark latest capture correct")
+    click.echo("  Alt + Shift + X : Mark latest capture incorrect")
     click.echo("  Alt + Shift + H : Show help menu")
     click.echo("  Alt + Shift + E : Exit listener")
 
@@ -78,6 +87,7 @@ def print_core_help(include_title=True):
     click.echo("  python otto.py capture")
     click.echo("  python otto.py answer [Q_ID]     (Q_ID is optional)")
     click.echo("  python otto.py study-generate")
+    click.echo("  python otto.py feedback-mark")
     click.echo("  python otto.py shell             (interactive text-command mode)")
     click.echo("  python otto.py help-menu")
 
@@ -133,6 +143,14 @@ def print_study_help(include_title=True):
     click.echo("  python otto.py study-generate --question-order grouped|capture|random")
 
 
+def print_feedback_help(include_title=True):
+    if include_title:
+        click.echo(click.style("\nFeedback commands:", fg='cyan', bold=True))
+    click.echo("  python otto.py feedback-mark [TARGET_ID] --type capture|study --status correct|incorrect|unverified")
+    click.echo("  python otto.py feedback-mark --interactive")
+    click.echo("  python otto.py feedback-list [--folder NAME] [--status incorrect] [--limit 20]")
+
+
 def print_help_menu():
     click.echo(click.style("\nAI-Study-Tool Help", fg='cyan', bold=True))
     
@@ -144,6 +162,7 @@ def print_help_menu():
     click.echo("  python otto.py settings-help             (settings commands)")
     click.echo("  python otto.py model-help                (model commands)")
     click.echo("  python otto.py study-help                (study generation commands)")
+    click.echo("  python otto.py feedback-help             (feedback/correction commands)")
     
     print_core_help()
     print_folder_help()
@@ -151,6 +170,7 @@ def print_help_menu():
     print_settings_help()
     print_model_help()
     print_study_help()
+    print_feedback_help()
 
     click.echo("\nTip: Use '--help' on any command for detailed options.")
 
@@ -264,8 +284,10 @@ def _read_shell_input_with_timeout(prompt_text, timeout_seconds, poll_seconds=0.
         # Fallback for non-Windows environments.
         return input(prompt_text), False
 
+    sys.stdout.write("\r")
     sys.stdout.write(prompt_text)
     sys.stdout.flush()
+    prompt_started = time.time()
 
     deadline = time.time() + max(1.0, float(timeout_seconds))
     chars = []
@@ -298,6 +320,9 @@ def _read_shell_input_with_timeout(prompt_text, timeout_seconds, poll_seconds=0.
             deadline = time.time() + max(1.0, float(timeout_seconds))
 
             if ch in {"\r", "\n"}:
+                if not chars and (time.time() - prompt_started) < 0.15:
+                    # Ignore immediate stale Enter keypresses left in the console buffer.
+                    continue
                 sys.stdout.write("\n")
                 sys.stdout.flush()
                 return "".join(chars), False
@@ -446,6 +471,56 @@ def _resolve_question_limit(source_count, requested_limit=None):
     return min(60, max(1, parsed))
 
 
+def _build_feedback_context_block(folder_name, question_type=None, limit=6, char_budget=1800):
+    rows = get_feedback_for_prompt(folder_name, question_type=question_type, limit=limit)
+    if not rows:
+        return ""
+
+    lines = ["Recent user corrections to prioritize:"]
+    used = len(lines[0])
+    for idx, row in enumerate(rows, start=1):
+        qtype = str(row.get("question_type") or "unknown").strip()
+        model_answer = str(row.get("model_answer") or "").strip()
+        corrected = str(row.get("corrected_answer") or "").strip()
+        note = str(row.get("note") or "").strip()
+        text = f"{idx}. [{qtype}] model='{model_answer}'"
+        if corrected:
+            text += f" corrected='{corrected}'"
+        if note:
+            text += f" note='{note}'"
+
+        if used + len(text) + 1 > char_budget:
+            break
+        lines.append(text)
+        used += len(text) + 1
+
+    return "\n".join(lines).strip()
+
+
+def _resolve_feedback_target(target_type, target_id=None):
+    normalized_type = str(target_type or "capture").strip().lower()
+    provided_id = str(target_id or "").strip().upper()
+
+    if normalized_type == "capture":
+        if provided_id:
+            return provided_id
+        latest = get_latest_question()
+        return str(latest.get("id") or "").strip().upper() if latest else ""
+
+    if normalized_type == "study":
+        if provided_id:
+            return provided_id
+        latest_run = get_latest_study_run()
+        if not latest_run:
+            return ""
+        items = get_study_questions(latest_run.get("id"), limit=1)
+        if not items:
+            return ""
+        return str(items[0].get("id") or "").strip().upper()
+
+    return ""
+
+
 def _build_study_prompt(folder_name, rows, include_summary, include_questions, question_types, depth, answer_key, title_hint="", question_limit=None):
     source_items = []
     for row in rows:
@@ -477,6 +552,8 @@ def _build_study_prompt(folder_name, rows, include_summary, include_questions, q
         "answer_key_required": bool(answer_key and include_questions),
         "source_items": source_items,
     }
+
+    feedback_context = _build_feedback_context_block(folder_name, question_type=None, limit=6)
 
     return f"""
 You are generating study material from previously captured educational questions.
@@ -514,6 +591,9 @@ Rules:
 - Aim to generate target_question_count questions and never exceed max_questions.
 - Ensure answer and explanation exist for every generated practice question.
 - Keep content educational, concrete, and aligned to provided source_items.
+
+Known correction history (if any):
+{feedback_context if feedback_context else "(none)"}
 
 Input JSON:
 {json.dumps(prompt_payload, ensure_ascii=True)}
@@ -571,9 +651,11 @@ def _render_study_markdown(payload, include_summary=True, include_questions=True
         lines.append("## Practice Questions")
         lines.append("")
         for idx, item in enumerate(questions, start=1):
+            qid = str(item.get("id") or "").strip()
             prompt = str(item.get("question") or "").strip()
             qtype = str(item.get("type") or "").strip().replace("_", " ").title()
-            lines.append(f"### Q{idx}. {prompt}")
+            label = f"Q{idx}" if not qid else f"Q{idx} [{qid}]"
+            lines.append(f"### {label}. {prompt}")
             if qtype:
                 lines.append(f"Type: {qtype}")
             options = item.get("options") if isinstance(item.get("options"), list) else []
@@ -589,9 +671,11 @@ def _render_study_markdown(payload, include_summary=True, include_questions=True
         lines.append(f"> {AI_WARNING_TEXT}")
         lines.append("")
         for idx, item in enumerate(questions, start=1):
+            qid = str(item.get("id") or "").strip()
             answer = str(item.get("answer") or "").strip() or "(not provided)"
             explanation = str(item.get("explanation") or "").strip()
-            lines.append(f"- Q{idx}: {answer}")
+            label = f"Q{idx}" if not qid else f"Q{idx} [{qid}]"
+            lines.append(f"- {label}: {answer}")
             if explanation:
                 lines.append(f"  Explanation: {explanation}")
         lines.append("")
@@ -627,9 +711,11 @@ def _render_study_text(payload, include_summary=True, include_questions=True, an
     if include_questions and questions:
         lines.extend(["PRACTICE QUESTIONS", "------------------"])
         for idx, item in enumerate(questions, start=1):
+            qid = str(item.get("id") or "").strip()
             prompt = str(item.get("question") or "").strip()
             qtype = str(item.get("type") or "").strip().replace("_", " ").title()
-            lines.append(f"Q{idx}. {prompt}")
+            label = f"Q{idx}" if not qid else f"Q{idx} [{qid}]"
+            lines.append(f"{label}. {prompt}")
             if qtype:
                 lines.append(f"Type: {qtype}")
             options = item.get("options") if isinstance(item.get("options"), list) else []
@@ -642,9 +728,11 @@ def _render_study_text(payload, include_summary=True, include_questions=True, an
     if include_questions and answer_key and questions:
         lines.extend(["ANSWER KEY", "----------", AI_WARNING_TEXT, ""])
         for idx, item in enumerate(questions, start=1):
+            qid = str(item.get("id") or "").strip()
             answer = str(item.get("answer") or "").strip() or "(not provided)"
             explanation = str(item.get("explanation") or "").strip()
-            lines.append(f"Q{idx}: {answer}")
+            label = f"Q{idx}" if not qid else f"Q{idx} [{qid}]"
+            lines.append(f"{label}: {answer}")
             if explanation:
                 lines.append(f"  Explanation: {explanation}")
             lines.append("")
@@ -661,11 +749,14 @@ def _write_study_outputs(payload, folder_name, output_base, fmt, include_summary
     else:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         folder_piece = _sanitize_filename_piece(folder_name)
+        folder_parts = [part for part in str(folder_name or "").strip().replace("\\", "/").split("/") if part]
+        grouped_dir = os.path.join("captures", "study_materials", *folder_parts) if folder_parts else os.path.join("captures", "study_materials")
+        os.makedirs(grouped_dir, exist_ok=True)
         filename_title = _sanitize_filename_piece(title_hint) if str(title_hint or "").strip() else _sanitize_filename_piece(payload.get("title", ""))
         if filename_title and filename_title != "study":
-            base_path = os.path.join("captures", f"study_material_{filename_title}_{folder_piece}_{timestamp}")
+            base_path = os.path.join(grouped_dir, f"study_material_{filename_title}_{folder_piece}_{timestamp}")
         else:
-            base_path = os.path.join("captures", f"study_material_{folder_piece}_{timestamp}")
+            base_path = os.path.join(grouped_dir, f"study_material_{folder_piece}_{timestamp}")
 
     base_path = _resolve_unique_output_base(base_path, fmt)
 
@@ -1074,6 +1165,125 @@ def study_help_cmd():
     print_study_help()
 
 
+@cli.command(name="feedback-help")
+def feedback_help_cmd():
+    print_feedback_help()
+
+
+@cli.command(name="feedback-mark")
+@click.argument("target_id", required=False)
+@click.option("--type", "target_type", type=click.Choice(["capture", "study"], case_sensitive=False), default="capture", show_default=True)
+@click.option("--status", type=click.Choice(["correct", "incorrect", "unverified"], case_sensitive=False), default="correct", show_default=True)
+@click.option("--corrected-answer", default="", help="Correct answer text when marking incorrect.")
+@click.option("--note", default="", help="Optional note about the correction.")
+@click.option("--interactive", is_flag=True, default=False, help="Prompt for status and correction fields.")
+def feedback_mark_cmd(target_id, target_type, status, corrected_answer, note, interactive):
+    selected_type = str(target_type or "capture").strip().lower()
+    selected_status = str(status or "correct").strip().lower()
+    selected_corrected = str(corrected_answer or "").strip()
+    selected_note = str(note or "").strip()
+    selected_target_id = str(target_id or "").strip().upper()
+
+    if interactive:
+        _clear_pending_console_input()
+        selected_type = click.prompt(
+            "Target type",
+            default=selected_type,
+            show_default=True,
+            type=click.Choice(["capture", "study"], case_sensitive=False),
+        ).lower()
+
+        if selected_type == "study" and not selected_target_id:
+            latest_run = get_latest_study_run()
+            if latest_run:
+                run_id = latest_run.get("id")
+                run_rows = get_study_questions(run_id, limit=30)
+                if run_rows:
+                    click.echo(click.style("Latest study run questions:", fg='cyan', bold=True))
+                    for row in run_rows:
+                        pos = row.get("position")
+                        qid = str(row.get("id") or "")
+                        preview = str(row.get("question_text") or "").strip().replace("\n", " ")
+                        short_preview = preview[:90] + ("..." if len(preview) > 90 else "")
+                        click.echo(f"  {pos}. [{qid}] {short_preview}")
+                    _clear_pending_console_input()
+                    pick = click.prompt("Study question (enter SQ ID or list number)", default="", show_default=False).strip()
+                    if pick.isdigit():
+                        pos = int(pick)
+                        selected = next((row for row in run_rows if int(row.get("position") or 0) == pos), None)
+                        selected_target_id = str(selected.get("id") or "").strip().upper() if selected else ""
+                    else:
+                        selected_target_id = pick.upper()
+
+        _clear_pending_console_input()
+        selected_status = click.prompt(
+            "Status",
+            default=selected_status,
+            show_default=True,
+            type=click.Choice(["correct", "incorrect", "unverified"], case_sensitive=False),
+        ).lower()
+
+        if selected_status == "incorrect":
+            _clear_pending_console_input()
+            selected_note = click.prompt("What is wrong? (blank to skip)", default=selected_note, show_default=False).strip()
+            _clear_pending_console_input()
+            selected_corrected = click.prompt("What is the correct answer/text?", default=selected_corrected, show_default=False).strip()
+        else:
+            _clear_pending_console_input()
+            selected_note = click.prompt("Note (blank to skip)", default=selected_note, show_default=False).strip()
+
+    resolved_id = _resolve_feedback_target(selected_type, selected_target_id or target_id)
+    if not resolved_id:
+        if selected_type == "capture":
+            click.echo(click.style("No capture target found. Provide TARGET_ID or capture first.", fg='red', bold=True))
+        else:
+            click.echo(click.style("No study question target found. Provide TARGET_ID or generate study material first.", fg='red', bold=True))
+        return
+
+    result = save_feedback(
+        target_type=selected_type,
+        target_id=resolved_id,
+        status=selected_status,
+        corrected_answer=selected_corrected,
+        note=selected_note,
+    )
+    if not result.get("ok"):
+        reason = result.get("reason")
+        click.echo(click.style(f"Could not save feedback ({reason}).", fg='red', bold=True))
+        return
+
+    click.echo(click.style("Feedback saved.", fg='green', bold=True))
+    click.echo(f"Target: {result.get('target_type')}:{result.get('target_id')} | Status: {result.get('status')}")
+
+
+@cli.command(name="feedback-list")
+@click.option("--folder", "folder_name", default="", help="Filter to folder subtree.")
+@click.option("--type", "target_type", type=click.Choice(["capture", "study"], case_sensitive=False), default=None, help="Filter target type.")
+@click.option("--status", type=click.Choice(["correct", "incorrect", "unverified"], case_sensitive=False), default=None, help="Filter status.")
+@click.option("--limit", default=20, type=int, show_default=True)
+def feedback_list_cmd(folder_name, target_type, status, limit):
+    rows = list_feedback(
+        limit=max(1, min(int(limit), 200)),
+        folder_name=(folder_name or "").strip() or None,
+        target_type=(target_type or "").strip() or None,
+        status=(status or "").strip() or None,
+    )
+
+    if not rows:
+        click.echo(click.style("No feedback entries found.", fg='yellow', bold=True))
+        return
+
+    click.echo(click.style(f"Feedback entries ({len(rows)}):", fg='cyan', bold=True))
+    for row in rows:
+        fid = row.get("id")
+        target = f"{row.get('target_type')}:{row.get('target_id')}"
+        folder = row.get("folder") or "general"
+        entry_status = row.get("status")
+        corrected = str(row.get("corrected_answer") or "").strip()
+        corrected_note = f" | corrected: {corrected}" if corrected else ""
+        click.echo(f"- #{fid} [{entry_status}] {target} @ {folder}{corrected_note}")
+
+
 @cli.command(name="model-show")
 def show_model_fallbacks_cmd():
     fallbacks = get_model_fallbacks()
@@ -1361,6 +1571,24 @@ def study_generate_cmd(
         click.echo(click.style(f"Study generation failed: {exc}", fg='red', bold=True))
         return
 
+    run_info = {"run_id": "", "questions": []}
+    questions_for_save = payload.get("practice_questions") if isinstance(payload.get("practice_questions"), list) else []
+    if include_questions and questions_for_save:
+        try:
+            run_info = save_study_run(
+                folder_name=target_folder,
+                title=selected_title or payload.get("title") or "",
+                model_used=payload.get("model_used") or "unknown",
+                output_files=[],
+                questions=questions_for_save,
+            )
+            saved_ids = [row.get("id") for row in run_info.get("questions", [])]
+            for idx, item in enumerate(questions_for_save):
+                if idx < len(saved_ids):
+                    item["id"] = saved_ids[idx]
+        except Exception as exc:
+            click.echo(click.style(f"Warning: could not persist study question IDs ({exc}).", fg='yellow'))
+
     try:
         output_files = _write_study_outputs(
             payload=payload,
@@ -1376,8 +1604,16 @@ def study_generate_cmd(
         click.echo(click.style(f"Could not write study output files: {exc}", fg='red', bold=True))
         return
 
+    if run_info.get("run_id"):
+        try:
+            update_study_run_outputs(run_info.get("run_id"), output_files)
+        except Exception:
+            pass
+
     click.echo(click.style("Study material generated.", fg='green', bold=True))
     click.echo(click.style(f"Model Used: {payload.get('model_used', 'unknown')}", fg='white'))
+    if run_info.get("run_id"):
+        click.echo(click.style(f"Study Run ID: {run_info.get('run_id')}", fg='cyan'))
     click.echo(click.style(AI_WARNING_TEXT, fg='yellow', bold=True))
     for file_path in output_files:
         click.echo(f"Saved: {file_path}")
@@ -1401,6 +1637,8 @@ def shell_cmd():
     click.echo(click.style(f"Auto-timeout: {timeout_minutes} minutes of inactivity.", fg='yellow'))
     command_history = []
     while True:
+        # Avoid stray buffered keypresses (especially CR/LF) from creating empty prompt lines.
+        _clear_pending_console_input()
         timeout_seconds = _get_timeout_minutes() * 60
         try:
             raw, timed_out = _read_shell_input_with_timeout("otto> ", timeout_seconds, history=command_history)
@@ -1449,8 +1687,8 @@ def shell_cmd():
             click.echo("Already in shell mode.")
             continue
 
+        previous_mode = _get_runtime_mode()
         try:
-            previous_mode = _get_runtime_mode()
             _set_runtime_mode("shell")
             cli.main(args=args, prog_name="otto.py", standalone_mode=False)
         except SystemExit:
@@ -1461,6 +1699,7 @@ def shell_cmd():
             click.echo(click.style(f"Command error: {error}", fg='red'))
         finally:
             _set_runtime_mode(previous_mode)
+            _clear_pending_console_input()
 
 
 @cli.command(name="folder-set")
@@ -1759,7 +1998,9 @@ def cycle_folder_cmd():
 
 @cli.command()
 def capture():
-    raw_response = capture_and_interpret()
+    active_folder = get_active_folder()
+    feedback_context = _build_feedback_context_block(active_folder, question_type=None, limit=6)
+    raw_response = capture_and_interpret(correction_context=feedback_context)
     
     try:
         data = _parse_json_response(raw_response)
@@ -1915,4 +2156,6 @@ def answer(q_id):
 
 if __name__ == "__main__":
     init_db()
+    if str(os.getenv("OTTO_RUN_MODE", "")).strip().lower() == "listener":
+        _clear_pending_console_input()
     cli()

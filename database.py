@@ -1,6 +1,7 @@
 import sqlite3
 import json
 import random
+import uuid
 from datetime import datetime
 
 DB_NAME = "otto.db"
@@ -56,6 +57,50 @@ def init_db():
         created_at TEXT
     )
     ''')
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS study_runs (
+        id TEXT PRIMARY KEY,
+        folder TEXT,
+        title TEXT,
+        model_used TEXT,
+        output_files TEXT,
+        created_at TEXT
+    )
+    ''')
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS study_questions (
+        id TEXT PRIMARY KEY,
+        run_id TEXT,
+        position INTEGER,
+        question_text TEXT,
+        question_type TEXT,
+        model_answer TEXT,
+        explanation TEXT,
+        source_folder TEXT,
+        created_at TEXT
+    )
+    ''')
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS feedback (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        target_type TEXT,
+        target_id TEXT,
+        folder TEXT,
+        question_type TEXT,
+        status TEXT,
+        model_answer TEXT,
+        corrected_answer TEXT,
+        note TEXT,
+        created_at TEXT
+    )
+    ''')
+
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_study_questions_run_id ON study_questions(run_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_feedback_target ON feedback(target_type, target_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_feedback_folder ON feedback(folder)")
 
     cursor.execute("PRAGMA table_info(questions)")
     existing_columns = {row[1] for row in cursor.fetchall()}
@@ -696,3 +741,227 @@ def rename_folder(old_name, new_name):
     conn.commit()
     conn.close()
     return {"ok": True, "old": old_normalized, "new": new_normalized}
+
+
+def _new_id(prefix):
+    return f"{prefix}{str(uuid.uuid4())[:8].upper()}"
+
+
+def save_study_run(folder_name, title, model_used, output_files, questions):
+    run_id = _new_id("SR")
+    created_text = datetime.now().isoformat()
+    normalized_folder = _normalize_folder_name(folder_name)
+
+    conn = _connect()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "INSERT INTO study_runs (id, folder, title, model_used, output_files, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            run_id,
+            normalized_folder,
+            str(title or "").strip(),
+            str(model_used or "unknown").strip(),
+            json.dumps(output_files or []),
+            created_text,
+        ),
+    )
+
+    saved_questions = []
+    for idx, item in enumerate(questions or [], start=1):
+        qid = _new_id("SQ")
+        question_type = str(item.get("type") or "").strip().lower().replace("-", "_")
+        question_text = str(item.get("question") or "").strip()
+        model_answer = str(item.get("answer") or "").strip()
+        explanation = str(item.get("explanation") or "").strip()
+        source_folder = _normalize_folder_name(item.get("source_folder") or normalized_folder)
+
+        cursor.execute(
+            "INSERT INTO study_questions (id, run_id, position, question_text, question_type, model_answer, explanation, source_folder, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (qid, run_id, idx, question_text, question_type, model_answer, explanation, source_folder, created_text),
+        )
+        saved_questions.append({
+            "id": qid,
+            "position": idx,
+            "question": question_text,
+            "type": question_type,
+            "answer": model_answer,
+            "source_folder": source_folder,
+        })
+
+    conn.commit()
+    conn.close()
+    return {"run_id": run_id, "questions": saved_questions}
+
+
+def get_latest_study_run():
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM study_runs ORDER BY created_at DESC LIMIT 1")
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def update_study_run_outputs(run_id, output_files):
+    rid = str(run_id or "").strip()
+    if not rid:
+        return False
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE study_runs SET output_files = ? WHERE id = ?",
+        (json.dumps(output_files or []), rid)
+    )
+    changed = int(cursor.rowcount or 0) > 0
+    conn.commit()
+    conn.close()
+    return changed
+
+
+def get_study_questions(run_id, limit=100):
+    rid = str(run_id or "").strip()
+    if not rid:
+        return []
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM study_questions WHERE run_id = ? ORDER BY position ASC LIMIT ?",
+        (rid, max(1, min(500, int(limit))))
+    )
+    rows = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return rows
+
+
+def get_study_question(question_id):
+    qid = str(question_id or "").strip().upper()
+    if not qid:
+        return None
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM study_questions WHERE id = ?", (qid,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def save_feedback(target_type, target_id, status, corrected_answer=None, note=None):
+    normalized_target_type = str(target_type or "").strip().lower()
+    normalized_status = str(status or "").strip().lower().replace("_", "-")
+    if normalized_status == "assumed-correct":
+        normalized_status = "unverified"
+    normalized_target_id = str(target_id or "").strip().upper()
+    corrected_text = str(corrected_answer or "").strip()
+    note_text = str(note or "").strip()
+
+    if normalized_target_type not in {"capture", "study"}:
+        return {"ok": False, "reason": "invalid-target-type"}
+    if normalized_status not in {"correct", "incorrect", "unverified"}:
+        return {"ok": False, "reason": "invalid-status"}
+    if not normalized_target_id:
+        return {"ok": False, "reason": "missing-target-id"}
+
+    folder = ""
+    question_type = ""
+    model_answer = ""
+    if normalized_target_type == "capture":
+        row = get_question(normalized_target_id)
+        if not row:
+            return {"ok": False, "reason": "missing-capture", "target_id": normalized_target_id}
+        folder = _normalize_folder_name(row.get("path") or DEFAULT_FOLDER)
+        question_type = str(row.get("question_type") or "").strip()
+        model_answer = str(row.get("answer") or "").strip()
+    else:
+        row = get_study_question(normalized_target_id)
+        if not row:
+            return {"ok": False, "reason": "missing-study-question", "target_id": normalized_target_id}
+        folder = _normalize_folder_name(row.get("source_folder") or DEFAULT_FOLDER)
+        question_type = str(row.get("question_type") or "").strip()
+        model_answer = str(row.get("model_answer") or "").strip()
+
+    conn = _connect()
+    cursor = conn.cursor()
+    created_text = datetime.now().isoformat()
+    cursor.execute(
+        "INSERT INTO feedback (target_type, target_id, folder, question_type, status, model_answer, corrected_answer, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            normalized_target_type,
+            normalized_target_id,
+            folder,
+            question_type,
+            normalized_status,
+            model_answer,
+            corrected_text,
+            note_text,
+            created_text,
+        ),
+    )
+    feedback_id = int(cursor.lastrowid)
+    conn.commit()
+    conn.close()
+    return {
+        "ok": True,
+        "id": feedback_id,
+        "target_type": normalized_target_type,
+        "target_id": normalized_target_id,
+        "status": normalized_status,
+    }
+
+
+def list_feedback(limit=20, folder_name=None, target_type=None, status=None):
+    sql = "SELECT * FROM feedback WHERE 1=1"
+    params = []
+
+    if folder_name:
+        normalized_folder = _normalize_folder_name(folder_name)
+        sql += " AND (folder = ? OR folder LIKE ?)"
+        params.extend([normalized_folder, normalized_folder + "/%"])
+
+    if target_type:
+        sql += " AND target_type = ?"
+        params.append(str(target_type).strip().lower())
+
+    if status:
+        normalized_status = str(status).strip().lower().replace("_", "-")
+        if normalized_status == "assumed-correct":
+            normalized_status = "unverified"
+        sql += " AND status = ?"
+        params.append(normalized_status)
+
+    sql += " ORDER BY created_at DESC LIMIT ?"
+    params.append(max(1, min(500, int(limit))))
+
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute(sql, tuple(params))
+    rows = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return rows
+
+
+def get_feedback_for_prompt(folder_name, question_type=None, limit=6):
+    normalized_folder = _normalize_folder_name(folder_name)
+    qtype = str(question_type or "").strip().upper()
+
+    conn = _connect()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM feedback WHERE status = 'incorrect' ORDER BY created_at DESC LIMIT 300")
+    rows = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    scored = []
+    for row in rows:
+        row_folder = _normalize_folder_name(row.get("folder") or DEFAULT_FOLDER)
+        score = 0
+        if _is_descendant_path(normalized_folder, row_folder) or _is_descendant_path(row_folder, normalized_folder):
+            score += 5
+        if qtype and str(row.get("question_type") or "").strip().upper() == qtype:
+            score += 2
+        if str(row.get("corrected_answer") or "").strip():
+            score += 1
+        scored.append((score, str(row.get("created_at") or ""), row))
+
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    selected = [item[2] for item in scored[:max(1, min(20, int(limit)))]]
+    return selected
