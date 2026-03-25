@@ -471,7 +471,28 @@ def _resolve_question_limit(source_count, requested_limit=None):
     return min(60, max(1, parsed))
 
 
-def _build_feedback_context_block(folder_name, question_type=None, limit=6, char_budget=1800):
+def _build_feedback_context_block(folder_name, question_type=None, limit=None, char_budget=None):
+    """Build feedback context block respecting user settings for injection control."""
+    mode = get_setting("feedback_context_mode", "full").strip().lower()
+    if mode == "off":
+        return ""
+    
+    if limit is None:
+        try:
+            limit = int(get_setting("feedback_max_items", "6"))
+        except (ValueError, TypeError):
+            limit = 6
+    
+    if char_budget is None:
+        try:
+            char_budget = int(get_setting("feedback_char_budget", "1800"))
+        except (ValueError, TypeError):
+            char_budget = 1800
+    
+    if mode == "light":
+        limit = max(1, limit // 2)
+        char_budget = max(200, char_budget // 2)
+    
     rows = get_feedback_for_prompt(folder_name, question_type=question_type, limit=limit)
     if not rows:
         return ""
@@ -490,6 +511,9 @@ def _build_feedback_context_block(folder_name, question_type=None, limit=6, char
             text += f" note='{note}'"
 
         if used + len(text) + 1 > char_budget:
+            excluded_count = len(rows) - idx + 1
+            if excluded_count > 0:
+                lines.append(f"(... and {excluded_count} more excluded due to char budget)")
             break
         lines.append(text)
         used += len(text) + 1
@@ -1334,14 +1358,19 @@ def probe_models_cmd(apply, models):
 
 @cli.command(name="settings-show")
 def settings_show_cmd():
-    name_width = 20
+    name_width = 25
     click.echo(click.style("Settings:", fg='cyan', bold=True))
-    click.echo(f"  {'clear_on_capture':<{name_width}} = {get_setting('clear_on_capture', 'true')}   (clear terminal before capture output)")
-    click.echo(f"  {'clear_on_answer':<{name_width}} = {get_setting('clear_on_answer', 'false')}   (clear terminal before answer output)")
-    click.echo(f"  {'clear_on_folder_view':<{name_width}} = {get_setting('clear_on_folder_view', 'false')}   (clear before folder list/rotate output)")
-    click.echo(f"  {'timeout_minutes':<{name_width}} = {_get_timeout_minutes()}   (listener + shell inactivity timeout)")
+    click.echo(click.style("\n  Terminal & Interface:", fg='blue', bold=True))
+    click.echo(f"    {'clear_on_capture':<{name_width}} = {get_setting('clear_on_capture', 'true')}   (clear terminal before capture output)")
+    click.echo(f"    {'clear_on_answer':<{name_width}} = {get_setting('clear_on_answer', 'false')}   (clear terminal before answer output)")
+    click.echo(f"    {'clear_on_folder_view':<{name_width}} = {get_setting('clear_on_folder_view', 'false')}   (clear before folder list/rotate output)")
+    click.echo(f"    {'timeout_minutes':<{name_width}} = {_get_timeout_minutes()}   (listener + shell inactivity timeout)")
     model_setting = get_setting("model_fallbacks", "")
-    click.echo(f"  {'model_fallbacks':<{name_width}} = {model_setting if model_setting else '<default order>'}   (comma-separated model order)")
+    click.echo(f"    {'model_fallbacks':<{name_width}} = {model_setting if model_setting else '<default order>'}   (comma-separated model order)")
+    click.echo(click.style("\n  Feedback & Corrections:", fg='blue', bold=True))
+    click.echo(f"    {'feedback_context_mode':<{name_width}} = {get_setting('feedback_context_mode', 'full')}   (light|full|off: correction history injection)")
+    click.echo(f"    {'feedback_max_items':<{name_width}} = {get_setting('feedback_max_items', '6')}   (Max corrections per generation)")
+    click.echo(f"    {'feedback_char_budget':<{name_width}} = {get_setting('feedback_char_budget', '1800')}   (Max characters for corrections)")
 
 
 @cli.command(name="settings-set")
@@ -1350,6 +1379,42 @@ def settings_show_cmd():
 def settings_set_cmd(key, value):
     normalized_key = str(key or "").strip().lower()
     bool_allowed = {"clear_on_capture", "clear_on_answer", "clear_on_folder_view"}
+
+    if normalized_key == "feedback_context_mode":
+        normalized_value = str(value or "").strip().lower()
+        if normalized_value not in {"light", "full", "off"}:
+            click.echo(click.style("feedback_context_mode must be: light, full, or off.", fg='red', bold=True))
+            return
+        saved = set_setting(normalized_key, normalized_value)
+        click.echo(click.style(f"Updated {normalized_key} = {saved}", fg='green', bold=True))
+        return
+
+    if normalized_key == "feedback_max_items":
+        try:
+            parsed_items = int(str(value).strip())
+        except Exception:
+            click.echo(click.style("feedback_max_items must be an integer from 1 to 20.", fg='red', bold=True))
+            return
+        if parsed_items < 1 or parsed_items > 20:
+            click.echo(click.style("feedback_max_items must be between 1 and 20.", fg='red', bold=True))
+            return
+        saved = set_setting(normalized_key, str(parsed_items))
+        click.echo(click.style(f"Updated {normalized_key} = {saved}", fg='green', bold=True))
+        return
+
+    if normalized_key == "feedback_char_budget":
+        try:
+            parsed_budget = int(str(value).strip())
+        except Exception:
+            click.echo(click.style("feedback_char_budget must be an integer from 200 to 5000.", fg='red', bold=True))
+            return
+        if parsed_budget < 200 or parsed_budget > 5000:
+            click.echo(click.style("feedback_char_budget must be between 200 and 5000.", fg='red', bold=True))
+            return
+        saved = set_setting(normalized_key, str(parsed_budget))
+        click.echo(click.style(f"Updated {normalized_key} = {saved}", fg='green', bold=True))
+        return
+
     if normalized_key == "timeout_minutes":
         try:
             parsed_minutes = int(str(value).strip())
@@ -1365,7 +1430,7 @@ def settings_set_cmd(key, value):
 
     if normalized_key not in bool_allowed:
         click.echo(click.style(
-            "Unsupported setting key. Use clear_on_capture, clear_on_answer, clear_on_folder_view, or timeout_minutes.",
+            "Unsupported setting key. Use clear_on_capture, clear_on_answer, clear_on_folder_view, timeout_minutes, feedback_context_mode, feedback_max_items, or feedback_char_budget.",
             fg='red',
             bold=True
         ))
