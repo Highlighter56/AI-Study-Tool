@@ -14,6 +14,9 @@ DEFAULT_SETTINGS = {
     "clear_on_folder_view": "false",
     "timeout_minutes": "10",
     "model_fallbacks": "",
+    "feedback_context_mode": "full",
+    "feedback_max_items": "6",
+    "feedback_char_budget": "1800",
 }
 
 
@@ -940,7 +943,12 @@ def list_feedback(limit=20, folder_name=None, target_type=None, status=None):
     return rows
 
 
-def get_feedback_for_prompt(folder_name, question_type=None, limit=6):
+def get_feedback_for_prompt(folder_name, question_type=None, limit=6, include_scores=False):
+    """
+    Retrieve feedback for prompt injection with optional scoring info for debugging.
+    
+    Returns list of feedback dicts, optionally with scoring metadata.
+    """
     normalized_folder = _normalize_folder_name(folder_name)
     qtype = str(question_type or "").strip().upper()
 
@@ -953,14 +961,43 @@ def get_feedback_for_prompt(folder_name, question_type=None, limit=6):
     scored = []
     for row in rows:
         row_folder = _normalize_folder_name(row.get("folder") or DEFAULT_FOLDER)
-        score = 0
+        folder_score = 0.0
+        type_score = 0.0
+        content_score = 0.0
+        
+        # Folder proximity scoring
         if _is_descendant_path(normalized_folder, row_folder) or _is_descendant_path(row_folder, normalized_folder):
-            score += 5
+            folder_score = 0.95
+        elif normalized_folder.split("/")[0] == row_folder.split("/")[0]:
+            folder_score = 0.60
+        else:
+            folder_score = 0.30
+        
+        # Question type matching
         if qtype and str(row.get("question_type") or "").strip().upper() == qtype:
-            score += 2
+            type_score = 1.0
+        else:
+            type_score = 0.8
+        
+        # Content quality (has correction)
         if str(row.get("corrected_answer") or "").strip():
-            score += 1
-        scored.append((score, str(row.get("created_at") or ""), row))
+            content_score = 1.0
+        else:
+            content_score = 0.5
+        
+        # Combined score (weighted average)
+        combined = (folder_score * 0.5) + (type_score * 0.3) + (content_score * 0.2)
+        
+        timestamp = str(row.get("created_at") or "")
+        row_with_score = dict(row)
+        
+        if include_scores:
+            row_with_score["_folder_score"] = folder_score
+            row_with_score["_type_score"] = type_score
+            row_with_score["_content_score"] = content_score
+            row_with_score["_combined_score"] = combined
+        
+        scored.append((combined, timestamp, row_with_score))
 
     scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
     selected = [item[2] for item in scored[:max(1, min(20, int(limit)))]]
