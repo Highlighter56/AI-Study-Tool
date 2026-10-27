@@ -1,6 +1,6 @@
-# AI-Study-Tool
+# Otto | AI-Study-Tool
 
-AI-Study-Tool captures on-screen questions, sends them to Gemini for structured interpretation, stores results in SQLite, and helps you review answers with confidence notes.
+Otto captures on-screen questions, sends them to Gemini for structured interpretation, stores results in SQLite, and helps you review answers with confidence notes.
 
 ## What It Does
 
